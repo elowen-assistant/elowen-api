@@ -1,7 +1,9 @@
-FROM rust:1.87-bookworm AS build
+FROM rust:1.88-bookworm AS build
 WORKDIR /app
 
 COPY Cargo.toml Cargo.toml
+COPY Cargo.lock Cargo.lock
+COPY migrations migrations
 COPY src src
 
 RUN cargo build --release
