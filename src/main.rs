@@ -9,6 +9,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use sqlx::{FromRow, PgPool, postgres::PgPoolOptions, types::Json as SqlxJson};
 use std::{env, net::SocketAddr, time::Duration};
 use tokio::time::timeout;
@@ -54,11 +55,56 @@ struct MessageRecord {
     updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Serialize, Clone, FromRow)]
+struct JobRecord {
+    id: String,
+    short_id: String,
+    thread_id: String,
+    title: String,
+    status: String,
+    result: Option<String>,
+    failure_class: Option<String>,
+    repo_name: String,
+    device_id: Option<String>,
+    branch_name: Option<String>,
+    base_branch: Option<String>,
+    parent_job_id: Option<String>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, FromRow)]
+struct JobEventRow {
+    id: String,
+    job_id: String,
+    event_type: String,
+    payload_json: SqlxJson<Value>,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct JobEventRecord {
+    id: String,
+    job_id: String,
+    event_type: String,
+    payload_json: Value,
+    created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Serialize)]
 struct ThreadDetail {
     #[serde(flatten)]
     thread: ThreadRecord,
     messages: Vec<MessageRecord>,
+    jobs: Vec<JobRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct JobDetail {
+    #[serde(flatten)]
+    job: JobRecord,
+    events: Vec<JobEventRecord>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,6 +116,15 @@ struct CreateThreadRequest {
 struct CreateMessageRequest {
     role: String,
     content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateJobRequest {
+    title: String,
+    repo_name: String,
+    base_branch: Option<String>,
+    request_text: String,
+    device_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,6 +195,20 @@ struct AvailabilityProbeMessage {
     sent_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct JobDispatchMessage {
+    job_id: String,
+    short_id: String,
+    thread_id: String,
+    title: String,
+    device_id: String,
+    repo_name: String,
+    base_branch: String,
+    branch_name: String,
+    request_text: String,
+    dispatched_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
@@ -161,6 +230,13 @@ impl AppError {
     fn not_found(message: impl Into<anyhow::Error>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
+            error: message.into(),
+        }
+    }
+
+    fn conflict(message: impl Into<anyhow::Error>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
             error: message.into(),
         }
     }
@@ -232,6 +308,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/threads", get(list_threads).post(create_thread))
         .route("/api/v1/threads/{thread_id}", get(get_thread))
         .route("/api/v1/threads/{thread_id}/messages", post(create_message))
+        .route(
+            "/api/v1/threads/{thread_id}/jobs",
+            get(list_thread_jobs).post(create_job),
+        )
+        .route("/api/v1/jobs", get(list_jobs))
+        .route("/api/v1/jobs/{job_id}", get(get_job))
         .route("/api/v1/devices", get(list_devices))
         .route(
             "/api/v1/devices/{device_id}",
@@ -287,31 +369,15 @@ async fn get_thread(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
 ) -> Result<Json<ThreadDetail>, AppError> {
-    let thread = sqlx::query_as::<_, ThreadRecord>(
-        r#"
-        select id, title, status, current_summary_id, created_at, updated_at
-        from threads
-        where id = $1
-        "#,
-    )
-    .bind(&thread_id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| AppError::not_found(anyhow::anyhow!("thread not found")))?;
+    let thread = load_thread_record(&state.pool, &thread_id).await?;
+    let messages = load_thread_messages(&state.pool, &thread_id).await?;
+    let jobs = load_thread_jobs(&state.pool, &thread_id).await?;
 
-    let messages = sqlx::query_as::<_, MessageRecord>(
-        r#"
-        select id, thread_id, role, content, status, created_at, updated_at
-        from messages
-        where thread_id = $1
-        order by created_at asc, id asc
-        "#,
-    )
-    .bind(&thread_id)
-    .fetch_all(&state.pool)
-    .await?;
-
-    Ok(Json(ThreadDetail { thread, messages }))
+    Ok(Json(ThreadDetail {
+        thread,
+        messages,
+        jobs,
+    }))
 }
 
 async fn create_thread(
@@ -343,6 +409,7 @@ async fn create_thread(
         Json(ThreadDetail {
             thread,
             messages: Vec::new(),
+            jobs: Vec::new(),
         }),
     ))
 }
@@ -365,15 +432,7 @@ async fn create_message(
         )));
     }
 
-    let thread_exists =
-        sqlx::query_scalar::<_, i64>("select count(*)::bigint from threads where id = $1")
-            .bind(&thread_id)
-            .fetch_one(&state.pool)
-            .await?;
-
-    if thread_exists == 0 {
-        return Err(AppError::not_found(anyhow::anyhow!("thread not found")));
-    }
+    ensure_thread_exists(&state.pool, &thread_id).await?;
 
     let message_id = Ulid::new().to_string();
     let message = sqlx::query_as::<_, MessageRecord>(
@@ -390,12 +449,240 @@ async fn create_message(
     .fetch_one(&state.pool)
     .await?;
 
-    sqlx::query("update threads set updated_at = now() where id = $1")
-        .bind(&thread_id)
-        .execute(&state.pool)
-        .await?;
+    touch_thread(&state.pool, &thread_id).await?;
 
     Ok((StatusCode::CREATED, Json(message)))
+}
+
+async fn list_thread_jobs(
+    State(state): State<AppState>,
+    Path(thread_id): Path<String>,
+) -> Result<Json<Vec<JobRecord>>, AppError> {
+    ensure_thread_exists(&state.pool, &thread_id).await?;
+    let jobs = load_thread_jobs(&state.pool, &thread_id).await?;
+    Ok(Json(jobs))
+}
+
+async fn create_job(
+    State(state): State<AppState>,
+    Path(thread_id): Path<String>,
+    Json(request): Json<CreateJobRequest>,
+) -> Result<(StatusCode, Json<JobDetail>), AppError> {
+    ensure_thread_exists(&state.pool, &thread_id).await?;
+
+    let title = request.title.trim();
+    let repo_name = request.repo_name.trim();
+    let request_text = request.request_text.trim();
+    let base_branch =
+        sanitize_optional_string(request.base_branch).unwrap_or_else(|| "main".to_string());
+
+    if title.is_empty() {
+        return Err(AppError::bad_request(anyhow::anyhow!(
+            "job title is required"
+        )));
+    }
+
+    if repo_name.is_empty() {
+        return Err(AppError::bad_request(anyhow::anyhow!(
+            "repo name is required"
+        )));
+    }
+
+    if request_text.is_empty() {
+        return Err(AppError::bad_request(anyhow::anyhow!(
+            "job request text is required"
+        )));
+    }
+
+    let target_device =
+        select_dispatch_device(&state.pool, request.device_id.as_deref(), repo_name).await?;
+    let target_device_id = target_device.id.clone();
+    let job_id = Ulid::new().to_string();
+    let short_id = job_id
+        .chars()
+        .take(8)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let branch_name = format!("codex/{}-{}", short_id, slugify(title));
+
+    sqlx::query_as::<_, JobRecord>(
+        r#"
+        insert into jobs (
+            id,
+            short_id,
+            title,
+            thread_id,
+            status,
+            repo_name,
+            device_id,
+            branch_name,
+            base_branch
+        )
+        values ($1, $2, $3, $4, 'probing', $5, $6, $7, $8)
+        returning
+            id,
+            short_id,
+            thread_id,
+            title,
+            status,
+            result,
+            failure_class,
+            repo_name,
+            device_id,
+            branch_name,
+            base_branch,
+            parent_job_id,
+            created_at,
+            updated_at,
+            completed_at
+        "#,
+    )
+    .bind(&job_id)
+    .bind(&short_id)
+    .bind(title)
+    .bind(&thread_id)
+    .bind(repo_name)
+    .bind(&target_device_id)
+    .bind(&branch_name)
+    .bind(&base_branch)
+    .fetch_one(&state.pool)
+    .await?;
+
+    insert_job_event(
+        &state.pool,
+        &job_id,
+        "job.created",
+        json!({
+            "request_text": request_text,
+            "repo_name": repo_name,
+            "device_id": target_device_id,
+            "base_branch": base_branch.clone(),
+            "branch_name": branch_name.clone(),
+        }),
+    )
+    .await?;
+
+    let availability =
+        probe_device_via_nats(&state.nats, &target_device.id, Some(job_id.clone())).await?;
+
+    insert_job_event(
+        &state.pool,
+        &job_id,
+        "job.probe_result",
+        json!({
+            "available": availability.available,
+            "reason": availability.reason,
+            "probe_id": availability.probe_id,
+            "responded_at": availability.responded_at,
+        }),
+    )
+    .await?;
+
+    if !availability.available {
+        update_job_state(&state.pool, &job_id, "pending", None, None, None).await?;
+        let detail = load_job_detail(&state.pool, &job_id).await?;
+        return Ok((StatusCode::ACCEPTED, Json(detail)));
+    }
+
+    let dispatch = JobDispatchMessage {
+        job_id: job_id.clone(),
+        short_id,
+        thread_id: thread_id.clone(),
+        title: title.to_string(),
+        device_id: target_device.id.clone(),
+        repo_name: repo_name.to_string(),
+        base_branch: base_branch.clone(),
+        branch_name: branch_name.clone(),
+        request_text: request_text.to_string(),
+        dispatched_at: Utc::now(),
+    };
+    let dispatch_subject = format!("elowen.jobs.dispatch.{}", target_device.id);
+    let dispatch_payload =
+        serde_json::to_vec(&dispatch).context("failed to serialize job dispatch")?;
+
+    if let Err(error) = state
+        .nats
+        .publish(dispatch_subject.clone(), dispatch_payload.into())
+        .await
+    {
+        update_job_state(
+            &state.pool,
+            &job_id,
+            "failed",
+            Some("failure".to_string()),
+            Some("infrastructure".to_string()),
+            None,
+        )
+        .await?;
+        insert_job_event(
+            &state.pool,
+            &job_id,
+            "job.dispatch_failed",
+            json!({
+                "subject": dispatch_subject,
+                "error": error.to_string(),
+            }),
+        )
+        .await?;
+        return Err(AppError::from(anyhow::anyhow!(
+            "failed to publish job dispatch"
+        )));
+    }
+
+    update_job_state(&state.pool, &job_id, "dispatched", None, None, None).await?;
+    insert_job_event(
+        &state.pool,
+        &job_id,
+        "job.dispatched",
+        json!({
+            "subject": dispatch_subject,
+            "device_id": target_device.id.clone(),
+            "repo_name": repo_name,
+            "base_branch": base_branch.clone(),
+            "branch_name": branch_name.clone(),
+        }),
+    )
+    .await?;
+    touch_thread(&state.pool, &thread_id).await?;
+
+    let detail = load_job_detail(&state.pool, &job_id).await?;
+    Ok((StatusCode::CREATED, Json(detail)))
+}
+
+async fn list_jobs(State(state): State<AppState>) -> Result<Json<Vec<JobRecord>>, AppError> {
+    let jobs = sqlx::query_as::<_, JobRecord>(
+        r#"
+        select
+            id,
+            short_id,
+            thread_id,
+            title,
+            status,
+            result,
+            failure_class,
+            repo_name,
+            device_id,
+            branch_name,
+            base_branch,
+            parent_job_id,
+            created_at,
+            updated_at,
+            completed_at
+        from jobs
+        order by created_at desc, id desc
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    Ok(Json(jobs))
+}
+
+async fn get_job(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Result<Json<JobDetail>, AppError> {
+    Ok(Json(load_job_detail(&state.pool, &job_id).await?))
 }
 
 async fn list_devices(State(state): State<AppState>) -> Result<Json<Vec<DeviceRecord>>, AppError> {
@@ -524,6 +811,269 @@ async fn probe_device(
     Ok(Json(response))
 }
 
+async fn probe_device_via_nats(
+    nats: &NatsClient,
+    device_id: &str,
+    job_id: Option<String>,
+) -> Result<AvailabilitySnapshot, AppError> {
+    let probe = AvailabilityProbeMessage {
+        probe_id: Ulid::new().to_string(),
+        job_id,
+        device_id: device_id.to_string(),
+        sent_at: Utc::now(),
+    };
+    let subject = format!("elowen.devices.availability.probe.{device_id}");
+    let payload = serde_json::to_vec(&probe).context("failed to serialize probe")?;
+
+    let message = timeout(
+        Duration::from_secs(5),
+        nats.request(subject, payload.into()),
+    )
+    .await
+    .map_err(|_| AppError::gateway_timeout(anyhow::anyhow!("device probe timed out")))?
+    .context("device probe request failed")?;
+
+    let response: AvailabilitySnapshot = serde_json::from_slice(&message.payload)
+        .context("failed to decode device probe response")?;
+
+    if response.device_id != device_id || response.probe_id != probe.probe_id {
+        return Err(AppError::from(anyhow::anyhow!(
+            "device probe response did not match request"
+        )));
+    }
+
+    Ok(response)
+}
+
+async fn load_thread_record(pool: &PgPool, thread_id: &str) -> Result<ThreadRecord, AppError> {
+    sqlx::query_as::<_, ThreadRecord>(
+        r#"
+        select id, title, status, current_summary_id, created_at, updated_at
+        from threads
+        where id = $1
+        "#,
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| AppError::not_found(anyhow::anyhow!("thread not found")))
+}
+
+async fn load_thread_messages(
+    pool: &PgPool,
+    thread_id: &str,
+) -> Result<Vec<MessageRecord>, AppError> {
+    let messages = sqlx::query_as::<_, MessageRecord>(
+        r#"
+        select id, thread_id, role, content, status, created_at, updated_at
+        from messages
+        where thread_id = $1
+        order by created_at asc, id asc
+        "#,
+    )
+    .bind(thread_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(messages)
+}
+
+async fn load_thread_jobs(pool: &PgPool, thread_id: &str) -> Result<Vec<JobRecord>, AppError> {
+    let jobs = sqlx::query_as::<_, JobRecord>(
+        r#"
+        select
+            id,
+            short_id,
+            thread_id,
+            title,
+            status,
+            result,
+            failure_class,
+            repo_name,
+            device_id,
+            branch_name,
+            base_branch,
+            parent_job_id,
+            created_at,
+            updated_at,
+            completed_at
+        from jobs
+        where thread_id = $1
+        order by created_at desc, id desc
+        "#,
+    )
+    .bind(thread_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(jobs)
+}
+
+async fn load_job_detail(pool: &PgPool, job_id: &str) -> Result<JobDetail, AppError> {
+    let job = sqlx::query_as::<_, JobRecord>(
+        r#"
+        select
+            id,
+            short_id,
+            thread_id,
+            title,
+            status,
+            result,
+            failure_class,
+            repo_name,
+            device_id,
+            branch_name,
+            base_branch,
+            parent_job_id,
+            created_at,
+            updated_at,
+            completed_at
+        from jobs
+        where id = $1
+        "#,
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| AppError::not_found(anyhow::anyhow!("job not found")))?;
+
+    let events = sqlx::query_as::<_, JobEventRow>(
+        r#"
+        select id, job_id, event_type, payload_json, created_at
+        from job_events
+        where job_id = $1
+        order by created_at asc, id asc
+        "#,
+    )
+    .bind(job_id)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(job_event_from_row)
+    .collect();
+
+    Ok(JobDetail { job, events })
+}
+
+async fn insert_job_event(
+    pool: &PgPool,
+    job_id: &str,
+    event_type: &str,
+    payload_json: Value,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        insert into job_events (id, job_id, event_type, payload_json)
+        values ($1, $2, $3, $4)
+        "#,
+    )
+    .bind(Ulid::new().to_string())
+    .bind(job_id)
+    .bind(event_type)
+    .bind(SqlxJson(payload_json))
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn update_job_state(
+    pool: &PgPool,
+    job_id: &str,
+    status: &str,
+    result: Option<String>,
+    failure_class: Option<String>,
+    completed_at: Option<DateTime<Utc>>,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        update jobs
+        set status = $2,
+            result = $3,
+            failure_class = $4,
+            completed_at = $5,
+            updated_at = now()
+        where id = $1
+        "#,
+    )
+    .bind(job_id)
+    .bind(status)
+    .bind(result)
+    .bind(failure_class)
+    .bind(completed_at)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn ensure_thread_exists(pool: &PgPool, thread_id: &str) -> Result<(), AppError> {
+    let count = sqlx::query_scalar::<_, i64>("select count(*)::bigint from threads where id = $1")
+        .bind(thread_id)
+        .fetch_one(pool)
+        .await?;
+
+    if count == 0 {
+        return Err(AppError::not_found(anyhow::anyhow!("thread not found")));
+    }
+
+    Ok(())
+}
+
+async fn touch_thread(pool: &PgPool, thread_id: &str) -> Result<(), AppError> {
+    sqlx::query("update threads set updated_at = now() where id = $1")
+        .bind(thread_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn select_dispatch_device(
+    pool: &PgPool,
+    requested_device_id: Option<&str>,
+    repo_name: &str,
+) -> Result<DeviceRecord, AppError> {
+    if let Some(device_id) =
+        requested_device_id.and_then(|value| sanitize_optional_string(Some(value.to_string())))
+    {
+        let device = device_record_from_row(load_device_row(pool, &device_id).await?);
+        ensure_repo_allowed(&device, repo_name)?;
+        return Ok(device);
+    }
+
+    let devices = sqlx::query_as::<_, DeviceRow>(
+        r#"
+        select id, name, primary_flag, metadata, created_at, updated_at
+        from devices
+        order by primary_flag desc, updated_at desc, name asc
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    for device in devices {
+        let record = device_record_from_row(device);
+        if ensure_repo_allowed(&record, repo_name).is_ok() {
+            return Ok(record);
+        }
+    }
+
+    Err(AppError::conflict(anyhow::anyhow!(
+        "no registered device is eligible for the requested repository"
+    )))
+}
+
+fn ensure_repo_allowed(device: &DeviceRecord, repo_name: &str) -> Result<(), AppError> {
+    if device.allowed_repos.is_empty() || device.allowed_repos.iter().any(|repo| repo == repo_name)
+    {
+        return Ok(());
+    }
+
+    Err(AppError::bad_request(anyhow::anyhow!(
+        "device is not allowed to run the requested repository"
+    )))
+}
+
 async fn load_device_row(pool: &PgPool, device_id: &str) -> Result<DeviceRow, AppError> {
     load_device_row_optional(pool, device_id)
         .await?
@@ -596,6 +1146,16 @@ fn device_record_from_row(row: DeviceRow) -> DeviceRecord {
     }
 }
 
+fn job_event_from_row(row: JobEventRow) -> JobEventRecord {
+    JobEventRecord {
+        id: row.id,
+        job_id: row.job_id,
+        event_type: row.event_type,
+        payload_json: row.payload_json.0,
+        created_at: row.created_at,
+    }
+}
+
 fn sanitize_string_list(values: Vec<String>) -> Vec<String> {
     let mut sanitized = Vec::new();
 
@@ -620,4 +1180,26 @@ fn sanitize_optional_string(value: Option<String>) -> Option<String> {
             Some(trimmed.to_string())
         }
     })
+}
+
+fn slugify(value: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_dash = false;
+
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+
+    let trimmed = slug.trim_matches('-');
+    if trimmed.is_empty() {
+        "job".to_string()
+    } else {
+        trimmed.chars().take(32).collect()
+    }
 }
