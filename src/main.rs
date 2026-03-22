@@ -8,13 +8,14 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{FromRow, PgPool, postgres::PgPoolOptions, types::Json as SqlxJson};
 use std::{env, net::SocketAddr, time::Duration};
 use tokio::time::timeout;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::info;
+use tracing::{info, warn};
 use ulid::Ulid;
 
 #[derive(Clone)]
@@ -209,11 +210,26 @@ struct JobDispatchMessage {
     dispatched_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JobLifecycleEvent {
+    job_id: String,
+    device_id: String,
+    event_type: String,
+    status: Option<String>,
+    result: Option<String>,
+    failure_class: Option<String>,
+    worktree_path: Option<String>,
+    detail: Option<String>,
+    payload_json: Option<Value>,
+    created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
 }
 
+#[derive(Debug)]
 struct AppError {
     status: StatusCode,
     error: anyhow::Error,
@@ -296,6 +312,14 @@ async fn main() -> anyhow::Result<()> {
     let nats = async_nats::connect(&nats_url)
         .await
         .context("failed to connect to NATS")?;
+
+    let event_pool = pool.clone();
+    let event_nats = nats.clone();
+    tokio::spawn(async move {
+        if let Err(error) = consume_job_lifecycle_events(event_pool, event_nats).await {
+            warn!(error = %error, "job lifecycle consumer stopped");
+        }
+    });
 
     let port = env::var("PORT")
         .ok()
@@ -845,6 +869,103 @@ async fn probe_device_via_nats(
     Ok(response)
 }
 
+async fn consume_job_lifecycle_events(pool: PgPool, nats: NatsClient) -> anyhow::Result<()> {
+    let subject = "elowen.jobs.events".to_string();
+    let mut subscription = nats
+        .subscribe(subject.clone())
+        .await
+        .context("failed to subscribe to job lifecycle events")?;
+
+    info!(subject = %subject, "consuming job lifecycle events");
+
+    while let Some(message) = subscription.next().await {
+        let event: JobLifecycleEvent = match serde_json::from_slice(&message.payload) {
+            Ok(event) => event,
+            Err(error) => {
+                warn!(error = %error, "failed to decode job lifecycle event");
+                continue;
+            }
+        };
+
+        if let Err(error) = persist_job_lifecycle_event(&pool, &event).await {
+            warn!(
+                job_id = %event.job_id,
+                event_type = %event.event_type,
+                error = ?error,
+                "failed to persist job lifecycle event"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+async fn persist_job_lifecycle_event(
+    pool: &PgPool,
+    event: &JobLifecycleEvent,
+) -> Result<(), AppError> {
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "device_id".to_string(),
+        Value::String(event.device_id.clone()),
+    );
+
+    if let Some(status) = &event.status {
+        payload.insert("status".to_string(), Value::String(status.clone()));
+    }
+
+    if let Some(result) = &event.result {
+        payload.insert("result".to_string(), Value::String(result.clone()));
+    }
+
+    if let Some(failure_class) = &event.failure_class {
+        payload.insert(
+            "failure_class".to_string(),
+            Value::String(failure_class.clone()),
+        );
+    }
+
+    if let Some(worktree_path) = &event.worktree_path {
+        payload.insert(
+            "worktree_path".to_string(),
+            Value::String(worktree_path.clone()),
+        );
+    }
+
+    if let Some(detail) = &event.detail {
+        payload.insert("detail".to_string(), Value::String(detail.clone()));
+    }
+
+    if let Some(extra_payload) = &event.payload_json {
+        payload.insert("payload".to_string(), extra_payload.clone());
+    }
+
+    insert_job_event(
+        pool,
+        &event.job_id,
+        &event.event_type,
+        Value::Object(payload),
+    )
+    .await?;
+
+    if let Some(status) = event.status.as_deref() {
+        let completed_at =
+            matches!(status, "completed" | "failed" | "cancelled").then_some(event.created_at);
+        update_job_state(
+            pool,
+            &event.job_id,
+            status,
+            event.result.clone(),
+            event.failure_class.clone(),
+            completed_at,
+        )
+        .await?;
+    }
+
+    touch_thread_for_job(pool, &event.job_id).await?;
+    Ok(())
+}
+
 async fn load_thread_record(pool: &PgPool, thread_id: &str) -> Result<ThreadRecord, AppError> {
     sqlx::query_as::<_, ThreadRecord>(
         r#"
@@ -1025,6 +1146,20 @@ async fn touch_thread(pool: &PgPool, thread_id: &str) -> Result<(), AppError> {
         .bind(thread_id)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+async fn touch_thread_for_job(pool: &PgPool, job_id: &str) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        update threads
+        set updated_at = now()
+        where id = (select thread_id from jobs where id = $1)
+        "#,
+    )
+    .bind(job_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
