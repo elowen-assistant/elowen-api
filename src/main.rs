@@ -63,6 +63,7 @@ struct MessageRecord {
 struct JobRecord {
     id: String,
     short_id: String,
+    correlation_id: String,
     thread_id: String,
     title: String,
     status: String,
@@ -82,6 +83,7 @@ struct JobRecord {
 struct JobEventRow {
     id: String,
     job_id: String,
+    correlation_id: String,
     event_type: String,
     payload_json: SqlxJson<Value>,
     created_at: DateTime<Utc>,
@@ -91,6 +93,7 @@ struct JobEventRow {
 struct JobEventRecord {
     id: String,
     job_id: String,
+    correlation_id: String,
     event_type: String,
     payload_json: Value,
     created_at: DateTime<Utc>,
@@ -287,6 +290,7 @@ struct AvailabilityProbeMessage {
 struct JobDispatchMessage {
     job_id: String,
     short_id: String,
+    correlation_id: String,
     thread_id: String,
     title: String,
     device_id: String,
@@ -300,6 +304,7 @@ struct JobDispatchMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JobLifecycleEvent {
     job_id: String,
+    correlation_id: String,
     device_id: String,
     event_type: String,
     status: Option<String>,
@@ -376,11 +381,32 @@ impl IntoResponse for AppError {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn init_tracing(service_name: &'static str) {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    let log_format = env::var("ELOWEN_LOG_FORMAT").unwrap_or_else(|_| "plain".to_string());
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_target(true);
+
+    if log_format.eq_ignore_ascii_case("json") {
+        builder
+            .json()
+            .with_current_span(false)
+            .with_span_list(false)
+            .flatten_event(true)
+            .with_ansi(false)
+            .init();
+    } else {
+        builder.with_ansi(true).init();
+    }
+
+    info!(service = service_name, log_format = %log_format, "tracing initialized");
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    init_tracing("elowen-api");
 
     let database_url = env::var("ELOWEN_DATABASE_URL").context("missing ELOWEN_DATABASE_URL")?;
     let nats_url = env::var("ELOWEN_NATS_URL").context("missing ELOWEN_NATS_URL")?;
@@ -634,18 +660,28 @@ async fn create_job(
         select_dispatch_device(&state.pool, request.device_id.as_deref(), repo_name).await?;
     let target_device_id = target_device.id.clone();
     let job_id = Ulid::new().to_string();
+    let correlation_id = Ulid::new().to_string();
     let short_id = job_id
         .chars()
         .take(8)
         .collect::<String>()
         .to_ascii_lowercase();
     let branch_name = format!("codex/{}-{}", short_id, slugify(title));
+    info!(
+        job_id = %job_id,
+        correlation_id = %correlation_id,
+        thread_id = %thread_id,
+        repo_name = %repo_name,
+        device_id = %target_device_id,
+        "creating job"
+    );
 
     sqlx::query_as::<_, JobRecord>(
         r#"
         insert into jobs (
             id,
             short_id,
+            correlation_id,
             title,
             thread_id,
             status,
@@ -654,10 +690,11 @@ async fn create_job(
             branch_name,
             base_branch
         )
-        values ($1, $2, $3, $4, 'probing', $5, $6, $7, $8)
+        values ($1, $2, $3, $4, $5, 'probing', $6, $7, $8, $9)
         returning
             id,
             short_id,
+            correlation_id,
             thread_id,
             title,
             status,
@@ -675,6 +712,7 @@ async fn create_job(
     )
     .bind(&job_id)
     .bind(&short_id)
+    .bind(&correlation_id)
     .bind(title)
     .bind(&thread_id)
     .bind(repo_name)
@@ -687,8 +725,10 @@ async fn create_job(
     insert_job_event(
         &state.pool,
         &job_id,
+        &correlation_id,
         "job.created",
         json!({
+            "correlation_id": correlation_id.clone(),
             "request_text": request_text,
             "repo_name": repo_name,
             "device_id": target_device_id,
@@ -704,8 +744,10 @@ async fn create_job(
     insert_job_event(
         &state.pool,
         &job_id,
+        &correlation_id,
         "job.probe_result",
         json!({
+            "correlation_id": correlation_id.clone(),
             "available": availability.available,
             "reason": availability.reason,
             "probe_id": availability.probe_id,
@@ -723,6 +765,7 @@ async fn create_job(
     let dispatch = JobDispatchMessage {
         job_id: job_id.clone(),
         short_id,
+        correlation_id: correlation_id.clone(),
         thread_id: thread_id.clone(),
         title: title.to_string(),
         device_id: target_device.id.clone(),
@@ -753,8 +796,10 @@ async fn create_job(
         insert_job_event(
             &state.pool,
             &job_id,
+            &correlation_id,
             "job.dispatch_failed",
             json!({
+                "correlation_id": correlation_id.clone(),
                 "subject": dispatch_subject,
                 "error": error.to_string(),
             }),
@@ -769,8 +814,10 @@ async fn create_job(
     insert_job_event(
         &state.pool,
         &job_id,
+        &correlation_id,
         "job.dispatched",
         json!({
+            "correlation_id": correlation_id.clone(),
             "subject": dispatch_subject,
             "device_id": target_device.id.clone(),
             "repo_name": repo_name,
@@ -791,6 +838,7 @@ async fn list_jobs(State(state): State<AppState>) -> Result<Json<Vec<JobRecord>>
         select
             id,
             short_id,
+            correlation_id,
             thread_id,
             title,
             status,
@@ -953,11 +1001,14 @@ async fn resolve_approval(
         }
     };
 
+    let correlation_id = load_job_correlation_id(&state.pool, &approval.job_id).await?;
     insert_job_event(
         &state.pool,
         &approval.job_id,
+        &correlation_id,
         &format!("approval.{status}"),
         json!({
+            "correlation_id": correlation_id.clone(),
             "approval_id": approval.id,
             "action_type": approval.action_type,
             "resolved_by": approval.resolved_by,
@@ -1153,9 +1204,17 @@ async fn consume_job_lifecycle_events(pool: PgPool, nats: NatsClient) -> anyhow:
         if let Err(error) = persist_job_lifecycle_event(&pool, &event).await {
             warn!(
                 job_id = %event.job_id,
+                correlation_id = %event.correlation_id,
                 event_type = %event.event_type,
                 error = ?error,
                 "failed to persist job lifecycle event"
+            );
+        } else {
+            info!(
+                job_id = %event.job_id,
+                correlation_id = %event.correlation_id,
+                event_type = %event.event_type,
+                "persisted job lifecycle event"
             );
         }
     }
@@ -1169,6 +1228,10 @@ async fn persist_job_lifecycle_event(
 ) -> Result<(), AppError> {
     let payload_value = event.payload_json.clone().unwrap_or_else(|| json!({}));
     let mut payload = serde_json::Map::new();
+    payload.insert(
+        "correlation_id".to_string(),
+        Value::String(event.correlation_id.clone()),
+    );
     payload.insert(
         "device_id".to_string(),
         Value::String(event.device_id.clone()),
@@ -1205,6 +1268,7 @@ async fn persist_job_lifecycle_event(
     insert_job_event(
         pool,
         &event.job_id,
+        &event.correlation_id,
         &event.event_type,
         Value::Object(payload),
     )
@@ -1253,8 +1317,10 @@ async fn persist_job_lifecycle_event(
         insert_job_event(
             pool,
             &event.job_id,
+            &event.correlation_id,
             "approval.requested",
             json!({
+                "correlation_id": event.correlation_id.clone(),
                 "approval_id": approval.id,
                 "action_type": approval.action_type,
                 "summary": approval.summary,
@@ -1306,6 +1372,7 @@ async fn load_thread_jobs(pool: &PgPool, thread_id: &str) -> Result<Vec<JobRecor
         select
             id,
             short_id,
+            correlation_id,
             thread_id,
             title,
             status,
@@ -1337,6 +1404,7 @@ async fn load_job_record(pool: &PgPool, job_id: &str) -> Result<JobRecord, AppEr
         select
             id,
             short_id,
+            correlation_id,
             thread_id,
             title,
             status,
@@ -1358,6 +1426,14 @@ async fn load_job_record(pool: &PgPool, job_id: &str) -> Result<JobRecord, AppEr
     .fetch_optional(pool)
     .await?
     .ok_or_else(|| AppError::not_found(anyhow::anyhow!("job not found")))
+}
+
+async fn load_job_correlation_id(pool: &PgPool, job_id: &str) -> Result<String, AppError> {
+    sqlx::query_scalar::<_, String>("select correlation_id from jobs where id = $1")
+        .bind(job_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| AppError::not_found(anyhow::anyhow!("job not found")))
 }
 
 async fn load_current_job_summary(
@@ -1401,7 +1477,7 @@ async fn load_job_detail(state: &AppState, job_id: &str) -> Result<JobDetail, Ap
 
     let events = sqlx::query_as::<_, JobEventRow>(
         r#"
-        select id, job_id, event_type, payload_json, created_at
+        select id, job_id, correlation_id, event_type, payload_json, created_at
         from job_events
         where job_id = $1
         order by created_at asc, id asc
@@ -1427,17 +1503,19 @@ async fn load_job_detail(state: &AppState, job_id: &str) -> Result<JobDetail, Ap
 async fn insert_job_event(
     pool: &PgPool,
     job_id: &str,
+    correlation_id: &str,
     event_type: &str,
     payload_json: Value,
 ) -> Result<(), AppError> {
     sqlx::query(
         r#"
-        insert into job_events (id, job_id, event_type, payload_json)
-        values ($1, $2, $3, $4)
+        insert into job_events (id, job_id, correlation_id, event_type, payload_json)
+        values ($1, $2, $3, $4, $5)
         "#,
     )
     .bind(Ulid::new().to_string())
     .bind(job_id)
+    .bind(correlation_id)
     .bind(event_type)
     .bind(SqlxJson(payload_json))
     .execute(pool)
@@ -1973,6 +2051,7 @@ fn job_event_from_row(row: JobEventRow) -> JobEventRecord {
     JobEventRecord {
         id: row.id,
         job_id: row.job_id,
+        correlation_id: row.correlation_id,
         event_type: row.event_type,
         payload_json: row.payload_json.0,
         created_at: row.created_at,
