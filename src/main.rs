@@ -9,10 +9,11 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
+use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{FromRow, PgPool, postgres::PgPoolOptions, types::Json as SqlxJson};
-use std::{env, net::SocketAddr, time::Duration};
+use std::{collections::HashSet, env, net::SocketAddr, time::Duration};
 use tokio::time::timeout;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
@@ -22,6 +23,8 @@ use ulid::Ulid;
 struct AppState {
     pool: PgPool,
     nats: NatsClient,
+    http: HttpClient,
+    notes_url: String,
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -99,6 +102,7 @@ struct ThreadDetail {
     thread: ThreadRecord,
     messages: Vec<MessageRecord>,
     jobs: Vec<JobRecord>,
+    related_notes: Vec<NoteRecord>,
 }
 
 #[derive(Debug, Serialize)]
@@ -108,7 +112,23 @@ struct JobDetail {
     execution_report_json: Value,
     summary: Option<SummaryRecord>,
     approvals: Vec<ApprovalRecord>,
+    related_notes: Vec<NoteRecord>,
     events: Vec<JobEventRecord>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct NoteRecord {
+    note_id: String,
+    title: String,
+    slug: String,
+    summary: String,
+    tags: Vec<String>,
+    aliases: Vec<String>,
+    note_type: String,
+    source_kind: Option<String>,
+    source_id: Option<String>,
+    current_revision_id: String,
+    updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -167,6 +187,32 @@ struct ResolveApprovalRequest {
     status: String,
     resolved_by: Option<String>,
     reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PromoteJobNoteRequest {
+    title: Option<String>,
+    summary: Option<String>,
+    body_markdown: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    aliases: Vec<String>,
+    note_type: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PromoteNoteRequest {
+    source_kind: Option<String>,
+    source_id: Option<String>,
+    title: Option<String>,
+    slug: Option<String>,
+    summary: Option<String>,
+    body_markdown: String,
+    tags: Vec<String>,
+    aliases: Vec<String>,
+    note_type: Option<String>,
+    frontmatter: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -338,6 +384,10 @@ async fn main() -> anyhow::Result<()> {
 
     let database_url = env::var("ELOWEN_DATABASE_URL").context("missing ELOWEN_DATABASE_URL")?;
     let nats_url = env::var("ELOWEN_NATS_URL").context("missing ELOWEN_NATS_URL")?;
+    let notes_url = env::var("ELOWEN_NOTES_URL")
+        .unwrap_or_else(|_| "http://elowen-notes:8080".to_string())
+        .trim_end_matches('/')
+        .to_string();
 
     let pool = PgPoolOptions::new()
         .max_connections(5)
@@ -353,6 +403,9 @@ async fn main() -> anyhow::Result<()> {
     let nats = async_nats::connect(&nats_url)
         .await
         .context("failed to connect to NATS")?;
+    let http = HttpClient::builder()
+        .build()
+        .context("failed to build HTTP client")?;
 
     let event_pool = pool.clone();
     let event_nats = nats.clone();
@@ -373,12 +426,18 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/threads", get(list_threads).post(create_thread))
         .route("/api/v1/threads/{thread_id}", get(get_thread))
         .route("/api/v1/threads/{thread_id}/messages", post(create_message))
+        .route("/api/v1/threads/{thread_id}/notes", get(get_thread_notes))
         .route(
             "/api/v1/threads/{thread_id}/jobs",
             get(list_thread_jobs).post(create_job),
         )
         .route("/api/v1/jobs", get(list_jobs))
         .route("/api/v1/jobs/{job_id}", get(get_job))
+        .route("/api/v1/jobs/{job_id}/notes", get(get_job_notes))
+        .route(
+            "/api/v1/jobs/{job_id}/notes/promote",
+            post(promote_job_note),
+        )
         .route(
             "/api/v1/approvals/{approval_id}/resolve",
             post(resolve_approval),
@@ -402,7 +461,12 @@ async fn main() -> anyhow::Result<()> {
                 ])
                 .allow_headers(Any),
         )
-        .with_state(AppState { pool, nats });
+        .with_state(AppState {
+            pool,
+            nats,
+            http,
+            notes_url,
+        });
 
     info!(%address, "starting elowen-api");
 
@@ -441,11 +505,13 @@ async fn get_thread(
     let thread = load_thread_record(&state.pool, &thread_id).await?;
     let messages = load_thread_messages(&state.pool, &thread_id).await?;
     let jobs = load_thread_jobs(&state.pool, &thread_id).await?;
+    let related_notes = load_related_thread_notes(&state, &thread, &messages, &jobs).await?;
 
     Ok(Json(ThreadDetail {
         thread,
         messages,
         jobs,
+        related_notes,
     }))
 }
 
@@ -479,6 +545,7 @@ async fn create_thread(
             thread,
             messages: Vec::new(),
             jobs: Vec::new(),
+            related_notes: Vec::new(),
         }),
     ))
 }
@@ -649,7 +716,7 @@ async fn create_job(
 
     if !availability.available {
         update_job_state(&state.pool, &job_id, "pending", None, None, None).await?;
-        let detail = load_job_detail(&state.pool, &job_id).await?;
+        let detail = load_job_detail(&state, &job_id).await?;
         return Ok((StatusCode::ACCEPTED, Json(detail)));
     }
 
@@ -714,7 +781,7 @@ async fn create_job(
     .await?;
     touch_thread(&state.pool, &thread_id).await?;
 
-    let detail = load_job_detail(&state.pool, &job_id).await?;
+    let detail = load_job_detail(&state, &job_id).await?;
     Ok((StatusCode::CREATED, Json(detail)))
 }
 
@@ -751,7 +818,71 @@ async fn get_job(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> Result<Json<JobDetail>, AppError> {
-    Ok(Json(load_job_detail(&state.pool, &job_id).await?))
+    Ok(Json(load_job_detail(&state, &job_id).await?))
+}
+
+async fn get_thread_notes(
+    State(state): State<AppState>,
+    Path(thread_id): Path<String>,
+) -> Result<Json<Vec<NoteRecord>>, AppError> {
+    let thread = load_thread_record(&state.pool, &thread_id).await?;
+    let messages = load_thread_messages(&state.pool, &thread_id).await?;
+    let jobs = load_thread_jobs(&state.pool, &thread_id).await?;
+    Ok(Json(
+        load_related_thread_notes(&state, &thread, &messages, &jobs).await?,
+    ))
+}
+
+async fn get_job_notes(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Result<Json<Vec<NoteRecord>>, AppError> {
+    let job = load_job_record(&state.pool, &job_id).await?;
+    let summary = load_current_job_summary(&state.pool, &job_id).await?;
+    Ok(Json(
+        load_related_job_notes(&state, &job, summary.as_ref()).await?,
+    ))
+}
+
+async fn promote_job_note(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+    Json(request): Json<PromoteJobNoteRequest>,
+) -> Result<(StatusCode, Json<NoteRecord>), AppError> {
+    let job = load_job_record(&state.pool, &job_id).await?;
+    let summary = load_current_job_summary(&state.pool, &job_id).await?;
+    let default_body = summary
+        .as_ref()
+        .map(|record| record.content.clone())
+        .unwrap_or_else(|| format!("# {}\n\nResult: {:?}\n", job.title, job.result));
+    let body_markdown = sanitize_optional_string(request.body_markdown).unwrap_or(default_body);
+
+    let promoted = promote_note_to_service(
+        &state,
+        PromoteNoteRequest {
+            source_kind: Some("job".to_string()),
+            source_id: Some(job.id.clone()),
+            title: request.title.or_else(|| Some(job.title.clone())),
+            slug: None,
+            summary: request.summary.or_else(|| {
+                summary
+                    .as_ref()
+                    .map(|record| summarize_text(&record.content, 240))
+            }),
+            body_markdown,
+            tags: request.tags,
+            aliases: request.aliases,
+            note_type: request.note_type,
+            frontmatter: Some(json!({
+                "job_id": job.id,
+                "repo_name": job.repo_name,
+                "branch_name": job.branch_name,
+            })),
+        },
+    )
+    .await?;
+
+    Ok((StatusCode::CREATED, Json(promoted)))
 }
 
 async fn resolve_approval(
@@ -1200,8 +1331,8 @@ async fn load_thread_jobs(pool: &PgPool, thread_id: &str) -> Result<Vec<JobRecor
     Ok(jobs)
 }
 
-async fn load_job_detail(pool: &PgPool, job_id: &str) -> Result<JobDetail, AppError> {
-    let job = sqlx::query_as::<_, JobRecord>(
+async fn load_job_record(pool: &PgPool, job_id: &str) -> Result<JobRecord, AppError> {
+    sqlx::query_as::<_, JobRecord>(
         r#"
         select
             id,
@@ -1226,8 +1357,29 @@ async fn load_job_detail(pool: &PgPool, job_id: &str) -> Result<JobDetail, AppEr
     .bind(job_id)
     .fetch_optional(pool)
     .await?
-    .ok_or_else(|| AppError::not_found(anyhow::anyhow!("job not found")))?;
+    .ok_or_else(|| AppError::not_found(anyhow::anyhow!("job not found")))
+}
 
+async fn load_current_job_summary(
+    pool: &PgPool,
+    job_id: &str,
+) -> Result<Option<SummaryRecord>, AppError> {
+    let summary_id = sqlx::query_scalar::<_, Option<String>>(
+        "select current_summary_id from jobs where id = $1",
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await?
+    .flatten();
+
+    match summary_id {
+        Some(summary_id) => Ok(Some(load_summary(pool, &summary_id).await?)),
+        None => Ok(None),
+    }
+}
+
+async fn load_job_detail(state: &AppState, job_id: &str) -> Result<JobDetail, AppError> {
+    let job = load_job_record(&state.pool, job_id).await?;
     let job_state = sqlx::query_as::<_, JobStateRow>(
         r#"
         select current_summary_id, execution_report_json
@@ -1236,15 +1388,16 @@ async fn load_job_detail(pool: &PgPool, job_id: &str) -> Result<JobDetail, AppEr
         "#,
     )
     .bind(job_id)
-    .fetch_one(pool)
+    .fetch_one(&state.pool)
     .await?;
 
     let summary = match job_state.current_summary_id {
-        Some(summary_id) => Some(load_summary(pool, &summary_id).await?),
+        Some(summary_id) => Some(load_summary(&state.pool, &summary_id).await?),
         None => None,
     };
 
-    let approvals = load_job_approvals(pool, job_id).await?;
+    let approvals = load_job_approvals(&state.pool, job_id).await?;
+    let related_notes = load_related_job_notes(state, &job, summary.as_ref()).await?;
 
     let events = sqlx::query_as::<_, JobEventRow>(
         r#"
@@ -1255,7 +1408,7 @@ async fn load_job_detail(pool: &PgPool, job_id: &str) -> Result<JobDetail, AppEr
         "#,
     )
     .bind(job_id)
-    .fetch_all(pool)
+    .fetch_all(&state.pool)
     .await?
     .into_iter()
     .map(job_event_from_row)
@@ -1266,6 +1419,7 @@ async fn load_job_detail(pool: &PgPool, job_id: &str) -> Result<JobDetail, AppEr
         execution_report_json: job_state.execution_report_json.0,
         summary,
         approvals,
+        related_notes,
         events,
     })
 }
@@ -1446,6 +1600,156 @@ async fn load_job_approvals(pool: &PgPool, job_id: &str) -> Result<Vec<ApprovalR
     .await?;
 
     Ok(approvals)
+}
+
+async fn load_related_thread_notes(
+    state: &AppState,
+    thread: &ThreadRecord,
+    messages: &[MessageRecord],
+    jobs: &[JobRecord],
+) -> Result<Vec<NoteRecord>, AppError> {
+    let mut promoted =
+        search_notes(state, None, Some("thread"), Some(thread.id.as_str()), 8).await?;
+    for job in jobs {
+        let job_notes = search_notes(state, None, Some("job"), Some(job.id.as_str()), 4).await?;
+        promoted = merge_note_sets(promoted, job_notes);
+    }
+    let query = build_thread_notes_query(thread, messages);
+    let related = search_notes(state, query.as_deref(), None, None, 6).await?;
+    Ok(merge_note_sets(promoted, related))
+}
+
+async fn load_related_job_notes(
+    state: &AppState,
+    job: &JobRecord,
+    summary: Option<&SummaryRecord>,
+) -> Result<Vec<NoteRecord>, AppError> {
+    let promoted = search_notes(state, None, Some("job"), Some(job.id.as_str()), 8).await?;
+    let query = build_job_notes_query(job, summary);
+    let related = search_notes(state, query.as_deref(), None, None, 6).await?;
+    Ok(merge_note_sets(promoted, related))
+}
+
+async fn search_notes(
+    state: &AppState,
+    query: Option<&str>,
+    source_kind: Option<&str>,
+    source_id: Option<&str>,
+    limit: usize,
+) -> Result<Vec<NoteRecord>, AppError> {
+    let url = format!("{}/api/v1/notes/search", state.notes_url);
+    let response = state
+        .http
+        .get(url)
+        .query(&[
+            ("q", query.unwrap_or("")),
+            ("source_kind", source_kind.unwrap_or("")),
+            ("source_id", source_id.unwrap_or("")),
+            ("limit", &limit.to_string()),
+        ])
+        .send()
+        .await
+        .context("failed to query notes service")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(AppError::from(anyhow::anyhow!(
+            "notes search failed with status {status}: {body}"
+        )));
+    }
+
+    response
+        .json::<Vec<NoteRecord>>()
+        .await
+        .context("failed to decode notes search response")
+        .map_err(AppError::from)
+}
+
+async fn promote_note_to_service(
+    state: &AppState,
+    request: PromoteNoteRequest,
+) -> Result<NoteRecord, AppError> {
+    let url = format!("{}/api/v1/notes/promotions", state.notes_url);
+    let response = state
+        .http
+        .post(url)
+        .json(&request)
+        .send()
+        .await
+        .context("failed to send note promotion request")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(AppError::from(anyhow::anyhow!(
+            "note promotion failed with status {status}: {body}"
+        )));
+    }
+
+    let detail = response
+        .json::<Value>()
+        .await
+        .context("failed to decode note promotion response")?;
+    let note = detail.get("note").cloned().unwrap_or(detail);
+
+    serde_json::from_value::<NoteRecord>(note)
+        .context("failed to parse promoted note response")
+        .map_err(AppError::from)
+}
+
+fn merge_note_sets(primary: Vec<NoteRecord>, secondary: Vec<NoteRecord>) -> Vec<NoteRecord> {
+    let mut seen = HashSet::new();
+    let mut merged = Vec::new();
+
+    for note in primary.into_iter().chain(secondary) {
+        if seen.insert(note.note_id.clone()) {
+            merged.push(note);
+        }
+    }
+
+    merged
+}
+
+fn build_thread_notes_query(thread: &ThreadRecord, messages: &[MessageRecord]) -> Option<String> {
+    let mut terms = vec![thread.title.clone()];
+    if let Some(message) = messages.iter().rev().find(|message| message.role == "user") {
+        terms.push(summarize_text(&message.content, 120));
+    }
+
+    let query = terms
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    (!query.is_empty()).then_some(query)
+}
+
+fn build_job_notes_query(job: &JobRecord, summary: Option<&SummaryRecord>) -> Option<String> {
+    let mut terms = vec![job.title.clone(), job.repo_name.clone()];
+    if let Some(summary) = summary {
+        terms.push(summarize_text(&summary.content, 120));
+    }
+
+    let query = terms
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    (!query.is_empty()).then_some(query)
+}
+
+fn summarize_text(value: &str, limit: usize) -> String {
+    let trimmed = value.trim();
+    if trimmed.chars().count() <= limit {
+        trimmed.to_string()
+    } else {
+        trimmed.chars().take(limit).collect::<String>()
+    }
 }
 
 async fn upsert_pending_push_approval(
