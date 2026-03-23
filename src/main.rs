@@ -105,7 +105,41 @@ struct ThreadDetail {
 struct JobDetail {
     #[serde(flatten)]
     job: JobRecord,
+    execution_report_json: Value,
+    summary: Option<SummaryRecord>,
+    approvals: Vec<ApprovalRecord>,
     events: Vec<JobEventRecord>,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+struct SummaryRecord {
+    id: String,
+    scope: String,
+    source_id: String,
+    version: i32,
+    content: String,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+struct ApprovalRecord {
+    id: String,
+    thread_id: String,
+    job_id: String,
+    action_type: String,
+    status: String,
+    summary: String,
+    resolved_by: Option<String>,
+    resolution_reason: Option<String>,
+    created_at: DateTime<Utc>,
+    resolved_at: Option<DateTime<Utc>>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, FromRow)]
+struct JobStateRow {
+    current_summary_id: Option<String>,
+    execution_report_json: SqlxJson<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,6 +160,13 @@ struct CreateJobRequest {
     base_branch: Option<String>,
     request_text: String,
     device_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolveApprovalRequest {
+    status: String,
+    resolved_by: Option<String>,
+    reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -338,6 +379,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/api/v1/jobs", get(list_jobs))
         .route("/api/v1/jobs/{job_id}", get(get_job))
+        .route(
+            "/api/v1/approvals/{approval_id}/resolve",
+            post(resolve_approval),
+        )
         .route("/api/v1/devices", get(list_devices))
         .route(
             "/api/v1/devices/{device_id}",
@@ -709,6 +754,93 @@ async fn get_job(
     Ok(Json(load_job_detail(&state.pool, &job_id).await?))
 }
 
+async fn resolve_approval(
+    State(state): State<AppState>,
+    Path(approval_id): Path<String>,
+    Json(request): Json<ResolveApprovalRequest>,
+) -> Result<Json<ApprovalRecord>, AppError> {
+    let status = match request.status.trim().to_ascii_lowercase().as_str() {
+        "approved" => "approved",
+        "rejected" => "rejected",
+        _ => {
+            return Err(AppError::bad_request(anyhow::anyhow!(
+                "approval status must be `approved` or `rejected`"
+            )));
+        }
+    };
+    let resolved_by = sanitize_optional_string(request.resolved_by);
+    let reason = sanitize_optional_string(request.reason);
+
+    let approval = sqlx::query_as::<_, ApprovalRecord>(
+        r#"
+        update approvals
+        set status = $2,
+            resolved_by = $3,
+            resolution_reason = $4,
+            resolved_at = now(),
+            updated_at = now()
+        where id = $1
+          and status = 'pending'
+        returning
+            id,
+            thread_id,
+            job_id,
+            action_type,
+            status,
+            summary,
+            resolved_by,
+            resolution_reason,
+            created_at,
+            resolved_at,
+            updated_at
+        "#,
+    )
+    .bind(&approval_id)
+    .bind(status)
+    .bind(resolved_by.clone())
+    .bind(reason.clone())
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let approval = match approval {
+        Some(approval) => approval,
+        None => {
+            let existing = sqlx::query_scalar::<_, i64>(
+                "select count(*)::bigint from approvals where id = $1",
+            )
+            .bind(&approval_id)
+            .fetch_one(&state.pool)
+            .await?;
+
+            if existing == 0 {
+                return Err(AppError::not_found(anyhow::anyhow!("approval not found")));
+            }
+
+            return Err(AppError::conflict(anyhow::anyhow!(
+                "approval has already been resolved"
+            )));
+        }
+    };
+
+    insert_job_event(
+        &state.pool,
+        &approval.job_id,
+        &format!("approval.{status}"),
+        json!({
+            "approval_id": approval.id,
+            "action_type": approval.action_type,
+            "resolved_by": approval.resolved_by,
+            "reason": approval.resolution_reason,
+        }),
+    )
+    .await?;
+
+    update_job_status_only(&state.pool, &approval.job_id, "completed").await?;
+    touch_thread_for_job(&state.pool, &approval.job_id).await?;
+
+    Ok(Json(approval))
+}
+
 async fn list_devices(State(state): State<AppState>) -> Result<Json<Vec<DeviceRecord>>, AppError> {
     let devices = sqlx::query_as::<_, DeviceRow>(
         r#"
@@ -904,6 +1036,7 @@ async fn persist_job_lifecycle_event(
     pool: &PgPool,
     event: &JobLifecycleEvent,
 ) -> Result<(), AppError> {
+    let payload_value = event.payload_json.clone().unwrap_or_else(|| json!({}));
     let mut payload = serde_json::Map::new();
     payload.insert(
         "device_id".to_string(),
@@ -936,9 +1069,7 @@ async fn persist_job_lifecycle_event(
         payload.insert("detail".to_string(), Value::String(detail.clone()));
     }
 
-    if let Some(extra_payload) = &event.payload_json {
-        payload.insert("payload".to_string(), extra_payload.clone());
-    }
+    payload.insert("payload".to_string(), payload_value.clone());
 
     insert_job_event(
         pool,
@@ -958,6 +1089,45 @@ async fn persist_job_lifecycle_event(
             event.result.clone(),
             event.failure_class.clone(),
             completed_at,
+        )
+        .await?;
+    }
+
+    if let Some(summary_markdown) = payload_value
+        .get("summary_markdown")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let _ = store_job_summary(pool, &event.job_id, summary_markdown).await?;
+    }
+
+    if let Some(execution_report) = payload_value.get("execution_report") {
+        update_job_execution_report(pool, &event.job_id, execution_report.clone()).await?;
+    }
+
+    if event.event_type == "job.awaiting_approval" {
+        let thread_id = sqlx::query_scalar::<_, String>("select thread_id from jobs where id = $1")
+            .bind(&event.job_id)
+            .fetch_one(pool)
+            .await?;
+        let approval_summary = payload_value
+            .get("summary")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Approve push for completed job");
+        let approval =
+            upsert_pending_push_approval(pool, &thread_id, &event.job_id, approval_summary).await?;
+        insert_job_event(
+            pool,
+            &event.job_id,
+            "approval.requested",
+            json!({
+                "approval_id": approval.id,
+                "action_type": approval.action_type,
+                "summary": approval.summary,
+            }),
         )
         .await?;
     }
@@ -1058,6 +1228,24 @@ async fn load_job_detail(pool: &PgPool, job_id: &str) -> Result<JobDetail, AppEr
     .await?
     .ok_or_else(|| AppError::not_found(anyhow::anyhow!("job not found")))?;
 
+    let job_state = sqlx::query_as::<_, JobStateRow>(
+        r#"
+        select current_summary_id, execution_report_json
+        from jobs
+        where id = $1
+        "#,
+    )
+    .bind(job_id)
+    .fetch_one(pool)
+    .await?;
+
+    let summary = match job_state.current_summary_id {
+        Some(summary_id) => Some(load_summary(pool, &summary_id).await?),
+        None => None,
+    };
+
+    let approvals = load_job_approvals(pool, job_id).await?;
+
     let events = sqlx::query_as::<_, JobEventRow>(
         r#"
         select id, job_id, event_type, payload_json, created_at
@@ -1073,7 +1261,13 @@ async fn load_job_detail(pool: &PgPool, job_id: &str) -> Result<JobDetail, AppEr
     .map(job_event_from_row)
     .collect();
 
-    Ok(JobDetail { job, events })
+    Ok(JobDetail {
+        job,
+        execution_report_json: job_state.execution_report_json.0,
+        summary,
+        approvals,
+        events,
+    })
 }
 
 async fn insert_job_event(
@@ -1126,6 +1320,196 @@ async fn update_job_state(
     .await?;
 
     Ok(())
+}
+
+async fn update_job_status_only(pool: &PgPool, job_id: &str, status: &str) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        update jobs
+        set status = $2,
+            updated_at = now()
+        where id = $1
+        "#,
+    )
+    .bind(job_id)
+    .bind(status)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn update_job_execution_report(
+    pool: &PgPool,
+    job_id: &str,
+    execution_report_json: Value,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        update jobs
+        set execution_report_json = $2,
+            updated_at = now()
+        where id = $1
+        "#,
+    )
+    .bind(job_id)
+    .bind(SqlxJson(execution_report_json))
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn store_job_summary(
+    pool: &PgPool,
+    job_id: &str,
+    content: &str,
+) -> Result<SummaryRecord, AppError> {
+    let version = sqlx::query_scalar::<_, i64>(
+        r#"
+        select coalesce(max(version), 0)::bigint + 1
+        from summaries
+        where scope = 'job' and source_id = $1
+        "#,
+    )
+    .bind(job_id)
+    .fetch_one(pool)
+    .await?;
+    let summary_id = Ulid::new().to_string();
+
+    let summary = sqlx::query_as::<_, SummaryRecord>(
+        r#"
+        insert into summaries (id, scope, source_id, version, content)
+        values ($1, 'job', $2, $3, $4)
+        returning id, scope, source_id, version, content, created_at
+        "#,
+    )
+    .bind(&summary_id)
+    .bind(job_id)
+    .bind(version as i32)
+    .bind(content)
+    .fetch_one(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        update jobs
+        set current_summary_id = $2,
+            updated_at = now()
+        where id = $1
+        "#,
+    )
+    .bind(job_id)
+    .bind(&summary_id)
+    .execute(pool)
+    .await?;
+
+    Ok(summary)
+}
+
+async fn load_summary(pool: &PgPool, summary_id: &str) -> Result<SummaryRecord, AppError> {
+    sqlx::query_as::<_, SummaryRecord>(
+        r#"
+        select id, scope, source_id, version, content, created_at
+        from summaries
+        where id = $1
+        "#,
+    )
+    .bind(summary_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| AppError::not_found(anyhow::anyhow!("summary not found")))
+}
+
+async fn load_job_approvals(pool: &PgPool, job_id: &str) -> Result<Vec<ApprovalRecord>, AppError> {
+    let approvals = sqlx::query_as::<_, ApprovalRecord>(
+        r#"
+        select
+            id,
+            thread_id,
+            job_id,
+            action_type,
+            status,
+            summary,
+            resolved_by,
+            resolution_reason,
+            created_at,
+            resolved_at,
+            updated_at
+        from approvals
+        where job_id = $1
+        order by created_at desc, id desc
+        "#,
+    )
+    .bind(job_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(approvals)
+}
+
+async fn upsert_pending_push_approval(
+    pool: &PgPool,
+    thread_id: &str,
+    job_id: &str,
+    summary: &str,
+) -> Result<ApprovalRecord, AppError> {
+    if let Some(approval) = sqlx::query_as::<_, ApprovalRecord>(
+        r#"
+        select
+            id,
+            thread_id,
+            job_id,
+            action_type,
+            status,
+            summary,
+            resolved_by,
+            resolution_reason,
+            created_at,
+            resolved_at,
+            updated_at
+        from approvals
+        where job_id = $1
+          and action_type = 'push'
+          and status = 'pending'
+        order by created_at desc, id desc
+        limit 1
+        "#,
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await?
+    {
+        return Ok(approval);
+    }
+
+    let approval_id = Ulid::new().to_string();
+    let approval = sqlx::query_as::<_, ApprovalRecord>(
+        r#"
+        insert into approvals (id, thread_id, job_id, action_type, status, summary)
+        values ($1, $2, $3, 'push', 'pending', $4)
+        returning
+            id,
+            thread_id,
+            job_id,
+            action_type,
+            status,
+            summary,
+            resolved_by,
+            resolution_reason,
+            created_at,
+            resolved_at,
+            updated_at
+        "#,
+    )
+    .bind(&approval_id)
+    .bind(thread_id)
+    .bind(job_id)
+    .bind(summary)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(approval)
 }
 
 async fn ensure_thread_exists(pool: &PgPool, thread_id: &str) -> Result<(), AppError> {
