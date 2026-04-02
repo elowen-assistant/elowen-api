@@ -199,6 +199,15 @@ struct CreateThreadChatRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct DispatchThreadMessageRequest {
+    source_message_id: String,
+    title: Option<String>,
+    repo_name: String,
+    base_branch: Option<String>,
+    device_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateJobRequest {
     title: String,
     repo_name: String,
@@ -268,6 +277,13 @@ struct ChatDispatchResponse {
 struct ChatReplyResponse {
     user_message: MessageRecord,
     assistant_message: MessageRecord,
+}
+
+#[derive(Debug, Serialize)]
+struct MessageDispatchResponse {
+    source_message: MessageRecord,
+    acknowledgement: MessageRecord,
+    job: JobRecord,
 }
 
 #[derive(Debug, Deserialize)]
@@ -518,6 +534,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/threads/{thread_id}/messages", post(create_message))
         .route("/api/v1/threads/{thread_id}/chat", post(create_thread_chat))
         .route(
+            "/api/v1/threads/{thread_id}/message-dispatch",
+            post(dispatch_thread_message),
+        )
+        .route(
             "/api/v1/threads/{thread_id}/chat-dispatch",
             post(create_chat_dispatch),
         )
@@ -707,6 +727,79 @@ async fn create_thread_chat(
         Json(ChatReplyResponse {
             user_message,
             assistant_message,
+        }),
+    ))
+}
+
+async fn dispatch_thread_message(
+    State(state): State<AppState>,
+    Path(thread_id): Path<String>,
+    Json(request): Json<DispatchThreadMessageRequest>,
+) -> Result<(StatusCode, Json<MessageDispatchResponse>), AppError> {
+    ensure_thread_exists(&state.pool, &thread_id).await?;
+
+    let repo_name = request.repo_name.trim();
+    if repo_name.is_empty() {
+        return Err(AppError::bad_request(anyhow::anyhow!(
+            "repo name is required"
+        )));
+    }
+
+    let source_message =
+        load_thread_message(&state.pool, &thread_id, request.source_message_id.trim()).await?;
+    if !matches!(source_message.role.as_str(), "user" | "assistant") {
+        return Err(AppError::bad_request(anyhow::anyhow!(
+            "only user or assistant messages can be dispatched"
+        )));
+    }
+
+    let request_text = source_message.content.trim();
+    if request_text.is_empty() {
+        return Err(AppError::bad_request(anyhow::anyhow!(
+            "source message content is required"
+        )));
+    }
+
+    let title = sanitize_optional_string(request.title)
+        .unwrap_or_else(|| derive_job_title_from_message(request_text));
+    let base_branch =
+        sanitize_optional_string(request.base_branch).unwrap_or_else(|| "main".to_string());
+
+    let job = create_job_record(
+        &state,
+        &thread_id,
+        &CreateJobRequest {
+            title,
+            repo_name: repo_name.to_string(),
+            base_branch: Some(base_branch),
+            request_text: request_text.to_string(),
+            device_id: request.device_id,
+        },
+    )
+    .await?;
+    let acknowledgement = insert_thread_message(
+        &state.pool,
+        &thread_id,
+        "system",
+        &format!(
+            "Escalated {} message `{}` into job `{}` for repo `{}`.\nRequest summary: {}",
+            source_message.role,
+            source_message.id,
+            job.short_id,
+            job.repo_name,
+            summarize_text(request_text, 160)
+        ),
+    )
+    .await?;
+
+    touch_thread(&state.pool, &thread_id).await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(MessageDispatchResponse {
+            source_message,
+            acknowledgement,
+            job,
         }),
     ))
 }
@@ -1565,6 +1658,25 @@ async fn load_thread_messages(
     .await?;
 
     Ok(messages)
+}
+
+async fn load_thread_message(
+    pool: &PgPool,
+    thread_id: &str,
+    message_id: &str,
+) -> Result<MessageRecord, AppError> {
+    sqlx::query_as::<_, MessageRecord>(
+        r#"
+        select id, thread_id, role, content, status, created_at, updated_at
+        from messages
+        where thread_id = $1 and id = $2
+        "#,
+    )
+    .bind(thread_id)
+    .bind(message_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| AppError::not_found(anyhow::anyhow!("thread message not found")))
 }
 
 async fn load_thread_jobs(pool: &PgPool, thread_id: &str) -> Result<Vec<JobRecord>, AppError> {
