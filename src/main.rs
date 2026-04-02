@@ -717,8 +717,14 @@ async fn create_thread_chat(
     let related_notes = load_related_thread_notes(&state, &thread, &messages, &jobs).await?;
     let assistant_reply =
         generate_conversational_reply(&state, &thread, &messages, &jobs, &related_notes).await?;
-    let assistant_message =
-        insert_thread_message(&state.pool, &thread_id, "assistant", &assistant_reply).await?;
+    let assistant_message = insert_thread_message_with_status(
+        &state.pool,
+        &thread_id,
+        "assistant",
+        &assistant_reply,
+        "conversation.reply",
+    )
+    .await?;
 
     touch_thread(&state.pool, &thread_id).await?;
 
@@ -777,7 +783,7 @@ async fn dispatch_thread_message(
         },
     )
     .await?;
-    let acknowledgement = insert_thread_message(
+    let acknowledgement = insert_thread_message_with_status(
         &state.pool,
         &thread_id,
         "system",
@@ -789,6 +795,7 @@ async fn dispatch_thread_message(
             job.repo_name,
             summarize_text(request_text, 160)
         ),
+        "workflow.handoff.created",
     )
     .await?;
 
@@ -843,7 +850,7 @@ async fn create_chat_dispatch(
         },
     )
     .await?;
-    let acknowledgement = insert_thread_message(
+    let acknowledgement = insert_thread_message_with_status(
         &state.pool,
         &thread_id,
         "system",
@@ -856,6 +863,7 @@ async fn create_chat_dispatch(
                 .unwrap_or_else(|| "unassigned".to_string()),
             job.repo_name
         ),
+        "workflow.dispatch.created",
     )
     .await?;
 
@@ -2133,7 +2141,7 @@ async fn request_assistant_reply(
         .json(&json!({
             "model": state.assistant.model,
             "instructions": build_conversation_instructions(),
-            "input": build_conversation_input(thread, messages, jobs, related_notes),
+            "input": build_conversation_input(&state.pool, thread, messages, jobs, related_notes).await?,
             "max_output_tokens": 600,
         }))
         .send()
@@ -2164,23 +2172,26 @@ fn build_conversation_instructions() -> &'static str {
 Reply conversationally and concisely. Use only the provided thread, job, and notes context. \
 Do not claim to have dispatched a laptop job, modified code, run tests, or inspected a worktree unless the context explicitly says that already happened. \
 When the user appears to want real code execution, planning, or repo changes, explain that execution happens through an explicit handoff into Workflow #1 and suggest using the dispatch controls when they are ready. \
-If the context is incomplete, say so plainly rather than inventing details."
+If the context is incomplete, say so plainly rather than inventing details. \
+When prior jobs, approvals, summaries, or notes materially support the answer, mention them briefly using labels like [Job 01abcd12] or [Note Title]."
 }
 
-fn build_conversation_input(
+async fn build_conversation_input(
+    pool: &PgPool,
     thread: &ThreadRecord,
     messages: &[MessageRecord],
     jobs: &[JobRecord],
     related_notes: &[NoteRecord],
-) -> String {
+) -> Result<String, AppError> {
     let latest_user = messages
         .iter()
         .rev()
         .find(|message| message.role == "user")
         .map(|message| summarize_text(&message.content, 600))
         .unwrap_or_default();
+    let job_context = load_conversation_job_context(pool, jobs, 4).await?;
 
-    format!(
+    Ok(format!(
         "Thread title: {title}\n\
 Thread status: {status}\n\
 \n\
@@ -2195,9 +2206,9 @@ Related notes:\n{note_context}\n",
         status = thread.status,
         latest_user = latest_user,
         message_context = format_message_context(messages, 10),
-        job_context = format_job_context(jobs, 3),
+        job_context = format_job_context(&job_context),
         note_context = format_note_context(related_notes, 4),
-    )
+    ))
 }
 
 fn format_message_context(messages: &[MessageRecord], limit: usize) -> String {
@@ -2213,9 +2224,11 @@ fn format_message_context(messages: &[MessageRecord], limit: usize) -> String {
         .into_iter()
         .rev()
         .map(|message| {
+            let mode = format_message_mode_label(message);
             format!(
-                "- [{}] {}",
+                "- [{} | {}] {}",
                 message.role,
+                mode,
                 summarize_text(&message.content, 280)
             )
         })
@@ -2223,28 +2236,62 @@ fn format_message_context(messages: &[MessageRecord], limit: usize) -> String {
         .join("\n")
 }
 
-fn format_job_context(jobs: &[JobRecord], limit: usize) -> String {
-    if jobs.is_empty() {
+struct ConversationJobContext {
+    job: JobRecord,
+    summary: Option<SummaryRecord>,
+    pending_approval: Option<ApprovalRecord>,
+}
+
+async fn load_conversation_job_context(
+    pool: &PgPool,
+    jobs: &[JobRecord],
+    limit: usize,
+) -> Result<Vec<ConversationJobContext>, AppError> {
+    let mut context = Vec::new();
+    for job in jobs.iter().take(limit) {
+        let summary = load_current_job_summary(pool, &job.id).await?;
+        let pending_approval = load_job_approvals(pool, &job.id)
+            .await?
+            .into_iter()
+            .find(|approval| approval.status == "pending");
+        context.push(ConversationJobContext {
+            job: job.clone(),
+            summary,
+            pending_approval,
+        });
+    }
+    Ok(context)
+}
+
+fn format_job_context(job_context: &[ConversationJobContext]) -> String {
+    if job_context.is_empty() {
         return "- none".to_string();
     }
 
-    jobs.iter()
-        .take(limit)
-        .map(|job| {
-            format!(
-                "- job `{}` in repo `{}` is `{}`{}{}",
-                job.short_id,
-                job.repo_name,
-                job.status,
-                job.result
-                    .as_deref()
-                    .map(|result| format!(", result `{result}`"))
-                    .unwrap_or_default(),
-                job.branch_name
-                    .as_deref()
-                    .map(|branch| format!(", branch `{branch}`"))
-                    .unwrap_or_default()
-            )
+    job_context
+        .iter()
+        .map(|entry| {
+            let job = &entry.job;
+            let mut parts = vec![format!(
+                "- [Job {}] repo `{}` is `{}`",
+                job.short_id, job.repo_name, job.status
+            )];
+            if let Some(result) = job.result.as_deref() {
+                parts.push(format!("result `{result}`"));
+            }
+            if let Some(branch) = job.branch_name.as_deref() {
+                parts.push(format!("branch `{branch}`"));
+            }
+            if let Some(summary) = entry.summary.as_ref() {
+                parts.push(format!("summary {}", summarize_text(&summary.content, 160)));
+            }
+            if let Some(approval) = entry.pending_approval.as_ref() {
+                parts.push(format!(
+                    "pending approval {}",
+                    summarize_text(&approval.summary, 120)
+                ));
+            }
+            parts.join(", ")
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -2260,13 +2307,29 @@ fn format_note_context(notes: &[NoteRecord], limit: usize) -> String {
         .take(limit)
         .map(|note| {
             format!(
-                "- note `{}`: {}",
+                "- [Note {}] kind `{}` updated `{}`: {}",
                 note.title,
+                note.source_kind.as_deref().unwrap_or("general"),
+                note.updated_at.to_rfc3339(),
                 summarize_text(&note.summary, 200)
             )
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn format_message_mode_label(message: &MessageRecord) -> &'static str {
+    if message.status == "conversation.reply" {
+        "conversation"
+    } else if message.status == "workflow.handoff.created" {
+        "handoff"
+    } else if message.status == "workflow.dispatch.created" {
+        "dispatch"
+    } else if message.status.starts_with("job_event:") {
+        "job-update"
+    } else {
+        "message"
+    }
 }
 
 fn extract_response_text(value: &Value) -> Option<String> {
