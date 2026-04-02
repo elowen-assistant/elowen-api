@@ -177,6 +177,15 @@ struct CreateMessageRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct CreateChatDispatchRequest {
+    content: String,
+    title: Option<String>,
+    repo_name: String,
+    base_branch: Option<String>,
+    device_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateJobRequest {
     title: String,
     repo_name: String,
@@ -216,6 +225,13 @@ struct PromoteNoteRequest {
     aliases: Vec<String>,
     note_type: Option<String>,
     frontmatter: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatDispatchResponse {
+    message: MessageRecord,
+    acknowledgement: MessageRecord,
+    job: JobRecord,
 }
 
 #[derive(Debug, Deserialize)]
@@ -452,6 +468,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/threads", get(list_threads).post(create_thread))
         .route("/api/v1/threads/{thread_id}", get(get_thread))
         .route("/api/v1/threads/{thread_id}/messages", post(create_message))
+        .route(
+            "/api/v1/threads/{thread_id}/chat-dispatch",
+            post(create_chat_dispatch),
+        )
         .route("/api/v1/threads/{thread_id}/notes", get(get_thread_notes))
         .route(
             "/api/v1/threads/{thread_id}/jobs",
@@ -595,25 +615,78 @@ async fn create_message(
     }
 
     ensure_thread_exists(&state.pool, &thread_id).await?;
-
-    let message_id = Ulid::new().to_string();
-    let message = sqlx::query_as::<_, MessageRecord>(
-        r#"
-        insert into messages (id, thread_id, role, content, status)
-        values ($1, $2, $3, $4, 'committed')
-        returning id, thread_id, role, content, status, created_at, updated_at
-        "#,
-    )
-    .bind(&message_id)
-    .bind(&thread_id)
-    .bind(&request.role)
-    .bind(content)
-    .fetch_one(&state.pool)
-    .await?;
+    let message = insert_thread_message(&state.pool, &thread_id, &request.role, content).await?;
 
     touch_thread(&state.pool, &thread_id).await?;
 
     Ok((StatusCode::CREATED, Json(message)))
+}
+
+async fn create_chat_dispatch(
+    State(state): State<AppState>,
+    Path(thread_id): Path<String>,
+    Json(request): Json<CreateChatDispatchRequest>,
+) -> Result<(StatusCode, Json<ChatDispatchResponse>), AppError> {
+    ensure_thread_exists(&state.pool, &thread_id).await?;
+
+    let content = request.content.trim();
+    if content.is_empty() {
+        return Err(AppError::bad_request(anyhow::anyhow!(
+            "message content is required"
+        )));
+    }
+
+    let repo_name = request.repo_name.trim();
+    if repo_name.is_empty() {
+        return Err(AppError::bad_request(anyhow::anyhow!(
+            "repo name is required"
+        )));
+    }
+
+    let title = sanitize_optional_string(request.title)
+        .unwrap_or_else(|| derive_job_title_from_message(content));
+    let base_branch =
+        sanitize_optional_string(request.base_branch).unwrap_or_else(|| "main".to_string());
+
+    let message = insert_thread_message(&state.pool, &thread_id, "user", content).await?;
+    let job = create_job_record(
+        &state,
+        &thread_id,
+        &CreateJobRequest {
+            title,
+            repo_name: repo_name.to_string(),
+            base_branch: Some(base_branch),
+            request_text: content.to_string(),
+            device_id: request.device_id,
+        },
+    )
+    .await?;
+    let acknowledgement = insert_thread_message(
+        &state.pool,
+        &thread_id,
+        "system",
+        &format!(
+            "Created job `{}` with status `{}` on device `{}` for repo `{}`.",
+            job.short_id,
+            job.status,
+            job.device_id
+                .clone()
+                .unwrap_or_else(|| "unassigned".to_string()),
+            job.repo_name
+        ),
+    )
+    .await?;
+
+    touch_thread(&state.pool, &thread_id).await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ChatDispatchResponse {
+            message,
+            acknowledgement,
+            job,
+        }),
+    ))
 }
 
 async fn list_thread_jobs(
@@ -631,12 +704,23 @@ async fn create_job(
     Json(request): Json<CreateJobRequest>,
 ) -> Result<(StatusCode, Json<JobDetail>), AppError> {
     ensure_thread_exists(&state.pool, &thread_id).await?;
+    let job = create_job_record(&state, &thread_id, &request).await?;
+    touch_thread(&state.pool, &thread_id).await?;
 
+    let detail = load_job_detail(&state, &job.id).await?;
+    Ok((StatusCode::CREATED, Json(detail)))
+}
+
+async fn create_job_record(
+    state: &AppState,
+    thread_id: &str,
+    request: &CreateJobRequest,
+) -> Result<JobRecord, AppError> {
     let title = request.title.trim();
     let repo_name = request.repo_name.trim();
     let request_text = request.request_text.trim();
     let base_branch =
-        sanitize_optional_string(request.base_branch).unwrap_or_else(|| "main".to_string());
+        sanitize_optional_string(request.base_branch.clone()).unwrap_or_else(|| "main".to_string());
 
     if title.is_empty() {
         return Err(AppError::bad_request(anyhow::anyhow!(
@@ -758,15 +842,14 @@ async fn create_job(
 
     if !availability.available {
         update_job_state(&state.pool, &job_id, "pending", None, None, None).await?;
-        let detail = load_job_detail(&state, &job_id).await?;
-        return Ok((StatusCode::ACCEPTED, Json(detail)));
+        return load_job_record(&state.pool, &job_id).await;
     }
 
     let dispatch = JobDispatchMessage {
         job_id: job_id.clone(),
         short_id,
         correlation_id: correlation_id.clone(),
-        thread_id: thread_id.clone(),
+        thread_id: thread_id.to_string(),
         title: title.to_string(),
         device_id: target_device.id.clone(),
         repo_name: repo_name.to_string(),
@@ -826,10 +909,7 @@ async fn create_job(
         }),
     )
     .await?;
-    touch_thread(&state.pool, &thread_id).await?;
-
-    let detail = load_job_detail(&state, &job_id).await?;
-    Ok((StatusCode::CREATED, Json(detail)))
+    load_job_record(&state.pool, &job_id).await
 }
 
 async fn list_jobs(State(state): State<AppState>) -> Result<Json<Vec<JobRecord>>, AppError> {
@@ -1907,6 +1987,30 @@ async fn ensure_thread_exists(pool: &PgPool, thread_id: &str) -> Result<(), AppE
     Ok(())
 }
 
+async fn insert_thread_message(
+    pool: &PgPool,
+    thread_id: &str,
+    role: &str,
+    content: &str,
+) -> Result<MessageRecord, AppError> {
+    let message_id = Ulid::new().to_string();
+    let message = sqlx::query_as::<_, MessageRecord>(
+        r#"
+        insert into messages (id, thread_id, role, content, status)
+        values ($1, $2, $3, $4, 'committed')
+        returning id, thread_id, role, content, status, created_at, updated_at
+        "#,
+    )
+    .bind(&message_id)
+    .bind(thread_id)
+    .bind(role)
+    .bind(content)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(message)
+}
+
 async fn touch_thread(pool: &PgPool, thread_id: &str) -> Result<(), AppError> {
     sqlx::query("update threads set updated_at = now() where id = $1")
         .bind(thread_id)
@@ -2082,6 +2186,27 @@ fn sanitize_optional_string(value: Option<String>) -> Option<String> {
             Some(trimmed.to_string())
         }
     })
+}
+
+fn derive_job_title_from_message(content: &str) -> String {
+    let trimmed = content.trim();
+    let mut title = trimmed
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("New coding task")
+        .trim()
+        .trim_end_matches(['.', '!', '?'])
+        .to_string();
+
+    if title.chars().count() > 72 {
+        title = title.chars().take(72).collect::<String>();
+    }
+
+    if title.is_empty() {
+        "New coding task".to_string()
+    } else {
+        title
+    }
 }
 
 fn slugify(value: &str) -> String {
