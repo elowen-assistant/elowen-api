@@ -25,6 +25,14 @@ struct AppState {
     nats: NatsClient,
     http: HttpClient,
     notes_url: String,
+    assistant: AssistantRuntime,
+}
+
+#[derive(Clone)]
+struct AssistantRuntime {
+    api_key: Option<String>,
+    model: String,
+    base_url: String,
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -186,6 +194,11 @@ struct CreateChatDispatchRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct CreateThreadChatRequest {
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateJobRequest {
     title: String,
     repo_name: String,
@@ -249,6 +262,12 @@ struct ChatDispatchResponse {
     message: MessageRecord,
     acknowledgement: MessageRecord,
     job: JobRecord,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatReplyResponse {
+    user_message: MessageRecord,
+    assistant_message: MessageRecord,
 }
 
 #[derive(Debug, Deserialize)]
@@ -447,6 +466,18 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "http://elowen-notes:8080".to_string())
         .trim_end_matches('/')
         .to_string();
+    let assistant_api_key = env::var("OPENAI_API_KEY")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let assistant_model = env::var("ELOWEN_ASSISTANT_MODEL")
+        .unwrap_or_else(|_| "gpt-4.1-mini".to_string())
+        .trim()
+        .to_string();
+    let assistant_base_url = env::var("ELOWEN_ASSISTANT_BASE_URL")
+        .unwrap_or_else(|_| "https://api.openai.com/v1".to_string())
+        .trim_end_matches('/')
+        .to_string();
 
     let pool = PgPoolOptions::new()
         .max_connections(5)
@@ -485,6 +516,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/threads", get(list_threads).post(create_thread))
         .route("/api/v1/threads/{thread_id}", get(get_thread))
         .route("/api/v1/threads/{thread_id}/messages", post(create_message))
+        .route("/api/v1/threads/{thread_id}/chat", post(create_thread_chat))
         .route(
             "/api/v1/threads/{thread_id}/chat-dispatch",
             post(create_chat_dispatch),
@@ -529,6 +561,11 @@ async fn main() -> anyhow::Result<()> {
             nats,
             http,
             notes_url,
+            assistant: AssistantRuntime {
+                api_key: assistant_api_key,
+                model: assistant_model,
+                base_url: assistant_base_url,
+            },
         });
 
     info!(%address, "starting elowen-api");
@@ -637,6 +674,41 @@ async fn create_message(
     touch_thread(&state.pool, &thread_id).await?;
 
     Ok((StatusCode::CREATED, Json(message)))
+}
+
+async fn create_thread_chat(
+    State(state): State<AppState>,
+    Path(thread_id): Path<String>,
+    Json(request): Json<CreateThreadChatRequest>,
+) -> Result<(StatusCode, Json<ChatReplyResponse>), AppError> {
+    ensure_thread_exists(&state.pool, &thread_id).await?;
+
+    let content = request.content.trim();
+    if content.is_empty() {
+        return Err(AppError::bad_request(anyhow::anyhow!(
+            "message content is required"
+        )));
+    }
+
+    let user_message = insert_thread_message(&state.pool, &thread_id, "user", content).await?;
+    let thread = load_thread_record(&state.pool, &thread_id).await?;
+    let messages = load_thread_messages(&state.pool, &thread_id).await?;
+    let jobs = load_thread_jobs(&state.pool, &thread_id).await?;
+    let related_notes = load_related_thread_notes(&state, &thread, &messages, &jobs).await?;
+    let assistant_reply =
+        generate_conversational_reply(&state, &thread, &messages, &jobs, &related_notes).await?;
+    let assistant_message =
+        insert_thread_message(&state.pool, &thread_id, "assistant", &assistant_reply).await?;
+
+    touch_thread(&state.pool, &thread_id).await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ChatReplyResponse {
+            user_message,
+            assistant_message,
+        }),
+    ))
 }
 
 async fn create_chat_dispatch(
@@ -1903,6 +1975,288 @@ async fn promote_note_to_service(
     serde_json::from_value::<NoteRecord>(note)
         .context("failed to parse promoted note response")
         .map_err(AppError::from)
+}
+
+async fn generate_conversational_reply(
+    state: &AppState,
+    thread: &ThreadRecord,
+    messages: &[MessageRecord],
+    jobs: &[JobRecord],
+    related_notes: &[NoteRecord],
+) -> Result<String, AppError> {
+    if state.assistant.api_key.is_some() {
+        match request_assistant_reply(state, thread, messages, jobs, related_notes).await {
+            Ok(reply) => return Ok(reply),
+            Err(error) => {
+                warn!(error = ?error, thread_id = %thread.id, "conversational assistant request failed; using fallback reply");
+            }
+        }
+    }
+
+    Ok(build_fallback_conversational_reply(
+        thread,
+        messages,
+        jobs,
+        related_notes,
+    ))
+}
+
+async fn request_assistant_reply(
+    state: &AppState,
+    thread: &ThreadRecord,
+    messages: &[MessageRecord],
+    jobs: &[JobRecord],
+    related_notes: &[NoteRecord],
+) -> Result<String, AppError> {
+    let api_key = state
+        .assistant
+        .api_key
+        .as_deref()
+        .ok_or_else(|| AppError::bad_request(anyhow::anyhow!("missing OPENAI_API_KEY")))?;
+    let url = format!("{}/responses", state.assistant.base_url);
+    let response = state
+        .http
+        .post(url)
+        .bearer_auth(api_key)
+        .json(&json!({
+            "model": state.assistant.model,
+            "instructions": build_conversation_instructions(),
+            "input": build_conversation_input(thread, messages, jobs, related_notes),
+            "max_output_tokens": 600,
+        }))
+        .send()
+        .await
+        .context("failed to send assistant response request")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(AppError::from(anyhow::anyhow!(
+            "assistant response request failed with status {status}: {body}"
+        )));
+    }
+
+    let body = response
+        .json::<Value>()
+        .await
+        .context("failed to decode assistant response")?;
+    extract_response_text(&body).ok_or_else(|| {
+        AppError::from(anyhow::anyhow!(
+            "assistant response did not include any text output"
+        ))
+    })
+}
+
+fn build_conversation_instructions() -> &'static str {
+    "You are Elowen, the orchestrator-side assistant in Workflow #2 conversational mode. \
+Reply conversationally and concisely. Use only the provided thread, job, and notes context. \
+Do not claim to have dispatched a laptop job, modified code, run tests, or inspected a worktree unless the context explicitly says that already happened. \
+When the user appears to want real code execution, planning, or repo changes, explain that execution happens through an explicit handoff into Workflow #1 and suggest using the dispatch controls when they are ready. \
+If the context is incomplete, say so plainly rather than inventing details."
+}
+
+fn build_conversation_input(
+    thread: &ThreadRecord,
+    messages: &[MessageRecord],
+    jobs: &[JobRecord],
+    related_notes: &[NoteRecord],
+) -> String {
+    let latest_user = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| summarize_text(&message.content, 600))
+        .unwrap_or_default();
+
+    format!(
+        "Thread title: {title}\n\
+Thread status: {status}\n\
+\n\
+Latest user message:\n{latest_user}\n\
+\n\
+Recent thread messages:\n{message_context}\n\
+\n\
+Recent related jobs:\n{job_context}\n\
+\n\
+Related notes:\n{note_context}\n",
+        title = thread.title,
+        status = thread.status,
+        latest_user = latest_user,
+        message_context = format_message_context(messages, 10),
+        job_context = format_job_context(jobs, 3),
+        note_context = format_note_context(related_notes, 4),
+    )
+}
+
+fn format_message_context(messages: &[MessageRecord], limit: usize) -> String {
+    if messages.is_empty() {
+        return "- none".to_string();
+    }
+
+    messages
+        .iter()
+        .rev()
+        .take(limit)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|message| {
+            format!(
+                "- [{}] {}",
+                message.role,
+                summarize_text(&message.content, 280)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_job_context(jobs: &[JobRecord], limit: usize) -> String {
+    if jobs.is_empty() {
+        return "- none".to_string();
+    }
+
+    jobs.iter()
+        .take(limit)
+        .map(|job| {
+            format!(
+                "- job `{}` in repo `{}` is `{}`{}{}",
+                job.short_id,
+                job.repo_name,
+                job.status,
+                job.result
+                    .as_deref()
+                    .map(|result| format!(", result `{result}`"))
+                    .unwrap_or_default(),
+                job.branch_name
+                    .as_deref()
+                    .map(|branch| format!(", branch `{branch}`"))
+                    .unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_note_context(notes: &[NoteRecord], limit: usize) -> String {
+    if notes.is_empty() {
+        return "- none".to_string();
+    }
+
+    notes
+        .iter()
+        .take(limit)
+        .map(|note| {
+            format!(
+                "- note `{}`: {}",
+                note.title,
+                summarize_text(&note.summary, 200)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn extract_response_text(value: &Value) -> Option<String> {
+    if let Some(text) = value.get("output_text").and_then(Value::as_str) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    let text = value
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|content| {
+            content
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(ToString::to_string)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn build_fallback_conversational_reply(
+    thread: &ThreadRecord,
+    messages: &[MessageRecord],
+    jobs: &[JobRecord],
+    related_notes: &[NoteRecord],
+) -> String {
+    let latest_user = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| message.content.trim())
+        .unwrap_or_default();
+    let latest_job = jobs.first();
+
+    if looks_like_execution_request(latest_user) {
+        let repo_hint = latest_job
+            .map(|job| {
+                format!(
+                    " The most recent job in this thread targeted repo `{}`.",
+                    job.repo_name
+                )
+            })
+            .unwrap_or_default();
+        return format!(
+            "I’m in conversational mode for thread `{}` right now, so I have not created a laptop job yet. \
+I can help refine the request or you can use the explicit dispatch controls to hand this off into Workflow #1 when you’re ready.{}",
+            thread.title, repo_hint
+        );
+    }
+
+    if let Some(job) = latest_job {
+        return format!(
+            "I’m here in conversational mode. The latest job in this thread is `{}` for repo `{}`, currently `{}`{}.\n\nI can help you reason about the next step, summarize what happened, or prepare an explicit handoff into laptop execution when you want it.",
+            job.short_id,
+            job.repo_name,
+            job.status,
+            job.result
+                .as_deref()
+                .map(|result| format!(", with result `{result}`"))
+                .unwrap_or_default()
+        );
+    }
+
+    if let Some(note) = related_notes.first() {
+        return format!(
+            "I’m here in conversational mode. I can answer questions about this thread, help plan work, or prepare an explicit laptop dispatch when needed.\n\nThe closest related note I found is `{}`: {}",
+            note.title,
+            summarize_text(&note.summary, 160)
+        );
+    }
+
+    "I’m here in conversational mode. Ask me questions, work through a plan with me, or use the explicit dispatch controls when you want me to create a real laptop job.".to_string()
+}
+
+fn looks_like_execution_request(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    [
+        "implement ",
+        "fix ",
+        "change ",
+        "edit ",
+        "update ",
+        "run ",
+        "dispatch ",
+        "create a job",
+        "send to laptop",
+        "review the code",
+        "write code",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn merge_note_sets(primary: Vec<NoteRecord>, secondary: Vec<NoteRecord>) -> Vec<NoteRecord> {
