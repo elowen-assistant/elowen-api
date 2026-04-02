@@ -215,6 +215,7 @@ struct PromoteJobNoteRequest {
 
 #[derive(Debug, Serialize)]
 struct PromoteNoteRequest {
+    note_id: Option<String>,
     source_kind: Option<String>,
     source_id: Option<String>,
     title: Option<String>,
@@ -225,6 +226,22 @@ struct PromoteNoteRequest {
     aliases: Vec<String>,
     note_type: Option<String>,
     frontmatter: Option<Value>,
+    authored_by: Option<NoteAuthor>,
+    source_references: Vec<NoteSourceReference>,
+}
+
+#[derive(Debug, Serialize)]
+struct NoteAuthor {
+    actor_type: String,
+    actor_id: String,
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct NoteSourceReference {
+    source_kind: String,
+    source_id: String,
+    label: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -979,15 +996,40 @@ async fn promote_job_note(
 ) -> Result<(StatusCode, Json<NoteRecord>), AppError> {
     let job = load_job_record(&state.pool, &job_id).await?;
     let summary = load_current_job_summary(&state.pool, &job_id).await?;
+    let existing_note_id = search_notes(&state, None, Some("job"), Some(job.id.as_str()), 1)
+        .await?
+        .into_iter()
+        .next()
+        .map(|note| note.note_id);
     let default_body = summary
         .as_ref()
         .map(|record| record.content.clone())
         .unwrap_or_else(|| format!("# {}\n\nResult: {:?}\n", job.title, job.result));
     let body_markdown = sanitize_optional_string(request.body_markdown).unwrap_or(default_body);
+    let mut source_references = vec![
+        NoteSourceReference {
+            source_kind: "job".to_string(),
+            source_id: job.id.clone(),
+            label: Some(format!("Job {}", job.short_id)),
+        },
+        NoteSourceReference {
+            source_kind: "thread".to_string(),
+            source_id: job.thread_id.clone(),
+            label: Some("Owning thread".to_string()),
+        },
+    ];
+    if let Some(summary) = summary.as_ref() {
+        source_references.push(NoteSourceReference {
+            source_kind: "summary".to_string(),
+            source_id: summary.id.clone(),
+            label: Some(format!("Job summary v{}", summary.version)),
+        });
+    }
 
     let promoted = promote_note_to_service(
         &state,
         PromoteNoteRequest {
+            note_id: existing_note_id,
             source_kind: Some("job".to_string()),
             source_id: Some(job.id.clone()),
             title: request.title.or_else(|| Some(job.title.clone())),
@@ -1006,6 +1048,12 @@ async fn promote_job_note(
                 "repo_name": job.repo_name,
                 "branch_name": job.branch_name,
             })),
+            authored_by: Some(NoteAuthor {
+                actor_type: "system".to_string(),
+                actor_id: "elowen-api".to_string(),
+                display_name: Some("Elowen API".to_string()),
+            }),
+            source_references,
         },
     )
     .await?;
