@@ -1409,6 +1409,7 @@ async fn persist_job_lifecycle_event(
         .await?;
     }
 
+    maybe_post_thread_assistant_reply(pool, event).await?;
     touch_thread_for_job(pool, &event.job_id).await?;
     Ok(())
 }
@@ -1993,11 +1994,21 @@ async fn insert_thread_message(
     role: &str,
     content: &str,
 ) -> Result<MessageRecord, AppError> {
+    insert_thread_message_with_status(pool, thread_id, role, content, "committed").await
+}
+
+async fn insert_thread_message_with_status(
+    pool: &PgPool,
+    thread_id: &str,
+    role: &str,
+    content: &str,
+    status: &str,
+) -> Result<MessageRecord, AppError> {
     let message_id = Ulid::new().to_string();
     let message = sqlx::query_as::<_, MessageRecord>(
         r#"
         insert into messages (id, thread_id, role, content, status)
-        values ($1, $2, $3, $4, 'committed')
+        values ($1, $2, $3, $4, $5)
         returning id, thread_id, role, content, status, created_at, updated_at
         "#,
     )
@@ -2005,10 +2016,35 @@ async fn insert_thread_message(
     .bind(thread_id)
     .bind(role)
     .bind(content)
+    .bind(status)
     .fetch_one(pool)
     .await?;
 
     Ok(message)
+}
+
+async fn maybe_insert_thread_message_with_status(
+    pool: &PgPool,
+    thread_id: &str,
+    role: &str,
+    content: &str,
+    status: &str,
+) -> Result<Option<MessageRecord>, AppError> {
+    let existing = sqlx::query_scalar::<_, String>(
+        "select id from messages where thread_id = $1 and status = $2 limit 1",
+    )
+    .bind(thread_id)
+    .bind(status)
+    .fetch_optional(pool)
+    .await?;
+
+    if existing.is_some() {
+        return Ok(None);
+    }
+
+    Ok(Some(
+        insert_thread_message_with_status(pool, thread_id, role, content, status).await?,
+    ))
 }
 
 async fn touch_thread(pool: &PgPool, thread_id: &str) -> Result<(), AppError> {
@@ -2017,6 +2053,201 @@ async fn touch_thread(pool: &PgPool, thread_id: &str) -> Result<(), AppError> {
         .execute(pool)
         .await?;
     Ok(())
+}
+
+async fn maybe_post_thread_assistant_reply(
+    pool: &PgPool,
+    event: &JobLifecycleEvent,
+) -> Result<(), AppError> {
+    let Some((status_marker, content)) = build_thread_assistant_reply(pool, event).await? else {
+        return Ok(());
+    };
+
+    let thread_id = sqlx::query_scalar::<_, String>("select thread_id from jobs where id = $1")
+        .bind(&event.job_id)
+        .fetch_one(pool)
+        .await?;
+
+    let inserted = maybe_insert_thread_message_with_status(
+        pool,
+        &thread_id,
+        "assistant",
+        &content,
+        &status_marker,
+    )
+    .await?;
+
+    if inserted.is_some() {
+        touch_thread(pool, &thread_id).await?;
+    }
+
+    Ok(())
+}
+
+async fn build_thread_assistant_reply(
+    pool: &PgPool,
+    event: &JobLifecycleEvent,
+) -> Result<Option<(String, String)>, AppError> {
+    let job = load_job_record(pool, &event.job_id).await?;
+    let summary = load_current_job_summary(pool, &event.job_id).await?;
+    let execution_report = load_job_execution_report(pool, &event.job_id).await?;
+    let build_status = execution_report
+        .as_ref()
+        .and_then(|report| execution_report_status(report, "build"));
+    let test_status = execution_report
+        .as_ref()
+        .and_then(|report| execution_report_status(report, "test"));
+    let changed_entries = execution_report
+        .as_ref()
+        .and_then(|report| execution_report_changed_entries(report));
+    let detail = event
+        .detail
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let reply = match event.event_type.as_str() {
+        "job.started" => Some((
+            format!("job_event:{}:started", event.job_id),
+            format!(
+                "I started working on job `{}` for repo `{}` on device `{}`.",
+                job.short_id, job.repo_name, event.device_id
+            ),
+        )),
+        "job.awaiting_approval" => {
+            let approval_summary = event
+                .payload_json
+                .as_ref()
+                .and_then(|payload| payload.get("summary"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("Push is waiting for approval.");
+
+            Some((
+                format!("job_event:{}:awaiting_approval", event.job_id),
+                format_success_reply(
+                    &job,
+                    build_status,
+                    test_status,
+                    changed_entries,
+                    approval_summary,
+                ),
+            ))
+        }
+        "job.completed" if event.result.as_deref() != Some("success") => Some((
+            format!("job_event:{}:completed", event.job_id),
+            format_failure_reply(
+                &job,
+                build_status,
+                test_status,
+                changed_entries,
+                detail,
+                summary.as_ref(),
+            ),
+        )),
+        "job.failed" => Some((
+            format!("job_event:{}:failed", event.job_id),
+            format_failure_reply(
+                &job,
+                build_status,
+                test_status,
+                changed_entries,
+                detail,
+                summary.as_ref(),
+            ),
+        )),
+        _ => None,
+    };
+
+    Ok(reply)
+}
+
+async fn load_job_execution_report(pool: &PgPool, job_id: &str) -> Result<Option<Value>, AppError> {
+    let report = sqlx::query_scalar::<_, SqlxJson<Value>>(
+        "select execution_report_json from jobs where id = $1",
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await?
+    .map(|value| value.0);
+
+    Ok(report.filter(|value| value != &json!({})))
+}
+
+fn execution_report_status<'a>(report: &'a Value, key: &str) -> Option<&'a str> {
+    report.get(key)?.get("status")?.as_str()
+}
+
+fn execution_report_changed_entries(report: &Value) -> Option<usize> {
+    report
+        .get("changed_files")?
+        .as_array()
+        .map(|items| items.len())
+}
+
+fn format_success_reply(
+    job: &JobRecord,
+    build_status: Option<&str>,
+    test_status: Option<&str>,
+    changed_entries: Option<usize>,
+    approval_summary: &str,
+) -> String {
+    let mut lines = vec![format!(
+        "I finished job `{}` for repo `{}` successfully.",
+        job.short_id, job.repo_name
+    )];
+
+    if let Some(branch_name) = &job.branch_name {
+        lines.push(format!("Branch: `{branch_name}`"));
+    }
+    if let Some(build_status) = build_status {
+        lines.push(format!("Build: {build_status}"));
+    }
+    if let Some(test_status) = test_status {
+        lines.push(format!("Test: {test_status}"));
+    }
+    if let Some(changed_entries) = changed_entries {
+        lines.push(format!("Changed entries: {changed_entries}"));
+    }
+
+    lines.push(String::new());
+    lines.push(approval_summary.to_string());
+    lines.join("\n")
+}
+
+fn format_failure_reply(
+    job: &JobRecord,
+    build_status: Option<&str>,
+    test_status: Option<&str>,
+    changed_entries: Option<usize>,
+    detail: Option<&str>,
+    summary: Option<&SummaryRecord>,
+) -> String {
+    let mut lines = vec![format!(
+        "I couldn't complete job `{}` for repo `{}`.",
+        job.short_id, job.repo_name
+    )];
+
+    if let Some(branch_name) = &job.branch_name {
+        lines.push(format!("Branch: `{branch_name}`"));
+    }
+    if let Some(build_status) = build_status {
+        lines.push(format!("Build: {build_status}"));
+    }
+    if let Some(test_status) = test_status {
+        lines.push(format!("Test: {test_status}"));
+    }
+    if let Some(changed_entries) = changed_entries {
+        lines.push(format!("Changed entries: {changed_entries}"));
+    }
+    if let Some(detail) = detail {
+        lines.push(format!("Detail: {}", truncate_text(detail, 240)));
+    } else if let Some(summary) = summary.filter(|summary| !summary.content.trim().is_empty()) {
+        lines.push(format!("Summary: {}", truncate_text(&summary.content, 240)));
+    }
+
+    lines.join("\n")
 }
 
 async fn touch_thread_for_job(pool: &PgPool, job_id: &str) -> Result<(), AppError> {
@@ -2207,6 +2438,14 @@ fn derive_job_title_from_message(content: &str) -> String {
     } else {
         title
     }
+}
+
+fn truncate_text(value: &str, max_chars: usize) -> String {
+    let mut truncated = value.trim().chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        truncated.push_str("...");
+    }
+    truncated
 }
 
 fn slugify(value: &str) -> String {
