@@ -2631,12 +2631,13 @@ async fn insert_thread_message_with_status_and_payload(
     Ok(message)
 }
 
-async fn maybe_insert_thread_message_with_status(
+async fn maybe_insert_thread_message_with_status_and_payload(
     pool: &PgPool,
     thread_id: &str,
     role: &str,
     content: &str,
     status: &str,
+    payload_json: Value,
 ) -> Result<Option<MessageRecord>, AppError> {
     let existing = sqlx::query_scalar::<_, String>(
         "select id from messages where thread_id = $1 and status = $2 limit 1",
@@ -2651,7 +2652,15 @@ async fn maybe_insert_thread_message_with_status(
     }
 
     Ok(Some(
-        insert_thread_message_with_status(pool, thread_id, role, content, status).await?,
+        insert_thread_message_with_status_and_payload(
+            pool,
+            thread_id,
+            role,
+            content,
+            status,
+            payload_json,
+        )
+        .await?,
     ))
 }
 
@@ -2667,7 +2676,9 @@ async fn maybe_post_thread_assistant_reply(
     pool: &PgPool,
     event: &JobLifecycleEvent,
 ) -> Result<(), AppError> {
-    let Some((status_marker, content)) = build_thread_assistant_reply(pool, event).await? else {
+    let Some((status_marker, content, payload_json)) =
+        build_thread_assistant_reply(pool, event).await?
+    else {
         return Ok(());
     };
 
@@ -2676,12 +2687,13 @@ async fn maybe_post_thread_assistant_reply(
         .fetch_one(pool)
         .await?;
 
-    let inserted = maybe_insert_thread_message_with_status(
+    let inserted = maybe_insert_thread_message_with_status_and_payload(
         pool,
         &thread_id,
         "assistant",
         &content,
         &status_marker,
+        payload_json,
     )
     .await?;
 
@@ -2695,7 +2707,7 @@ async fn maybe_post_thread_assistant_reply(
 async fn build_thread_assistant_reply(
     pool: &PgPool,
     event: &JobLifecycleEvent,
-) -> Result<Option<(String, String)>, AppError> {
+) -> Result<Option<(String, String, Value)>, AppError> {
     let job = load_job_record(pool, &event.job_id).await?;
     let summary = load_current_job_summary(pool, &event.job_id).await?;
     let execution_report = load_job_execution_report(pool, &event.job_id).await?;
@@ -2721,6 +2733,16 @@ async fn build_thread_assistant_reply(
         .map(str::trim)
         .filter(|value| !value.is_empty());
 
+    let make_completion_payload = |details: String| {
+        json!({
+            "job_result": {
+                "job_id": job.id,
+                "job_short_id": job.short_id,
+                "details": details,
+            }
+        })
+    };
+
     let reply = match event.event_type.as_str() {
         "job.started" => Some((
             format!("job_event:{}:started", event.job_id),
@@ -2728,6 +2750,7 @@ async fn build_thread_assistant_reply(
                 "I started working on job `{}` for repo `{}` on device `{}`.",
                 job.short_id, job.repo_name, event.device_id
             ),
+            json!({}),
         )),
         "job.push_started" => Some((
             format!("job_event:{}:push_started", event.job_id),
@@ -2737,6 +2760,7 @@ async fn build_thread_assistant_reply(
                 job.branch_name.as_deref().unwrap_or("unknown"),
                 event.device_id
             ),
+            json!({}),
         )),
         "job.push_completed" => Some((
             format!("job_event:{}:push_completed", event.job_id),
@@ -2745,6 +2769,7 @@ async fn build_thread_assistant_reply(
                 job.branch_name.as_deref().unwrap_or("unknown"),
                 job.short_id
             ),
+            json!({}),
         )),
         "job.awaiting_approval" => {
             let approval_summary = event
@@ -2755,32 +2780,43 @@ async fn build_thread_assistant_reply(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("Push is waiting for approval.");
+            let details = format_success_reply(
+                &job,
+                build_status,
+                test_status,
+                changed_entries,
+                last_message,
+                approval_summary,
+            );
+            let content = if let Some(last_message) = last_message {
+                format!("{last_message}\n\nPush approval is pending.")
+            } else {
+                details.clone()
+            };
 
             Some((
                 format!("job_event:{}:awaiting_approval", event.job_id),
-                format_success_reply(
-                    &job,
-                    build_status,
-                    test_status,
-                    changed_entries,
-                    last_message,
-                    approval_summary,
-                ),
+                content,
+                make_completion_payload(details),
             ))
         }
         "job.completed"
             if event.result.as_deref() == Some("success")
                 && matches!(execution_intent, Some(ExecutionIntent::ReadOnly)) =>
         {
+            let details = format_read_only_success_reply(
+                &job,
+                build_status,
+                test_status,
+                changed_entries,
+                last_message,
+            );
             Some((
                 format!("job_event:{}:completed", event.job_id),
-                format_read_only_success_reply(
-                    &job,
-                    build_status,
-                    test_status,
-                    changed_entries,
-                    last_message,
-                ),
+                last_message
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| details.clone()),
+                make_completion_payload(details),
             ))
         }
         "job.completed"
@@ -2792,15 +2828,19 @@ async fn build_thread_assistant_reply(
                     .and_then(Value::as_bool)
                     .unwrap_or(false) =>
         {
+            let details = format_success_without_push_reply(
+                &job,
+                build_status,
+                test_status,
+                changed_entries,
+                last_message,
+            );
             Some((
                 format!("job_event:{}:completed", event.job_id),
-                format_success_without_push_reply(
-                    &job,
-                    build_status,
-                    test_status,
-                    changed_entries,
-                    last_message,
-                ),
+                last_message
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| details.clone()),
+                make_completion_payload(details),
             ))
         }
         "job.completed" if event.result.as_deref() != Some("success") => Some((
@@ -2813,6 +2853,7 @@ async fn build_thread_assistant_reply(
                 detail,
                 summary.as_ref(),
             ),
+            json!({}),
         )),
         "job.failed" => Some((
             format!("job_event:{}:failed", event.job_id),
@@ -2824,6 +2865,7 @@ async fn build_thread_assistant_reply(
                 detail,
                 summary.as_ref(),
             ),
+            json!({}),
         )),
         _ => None,
     };
