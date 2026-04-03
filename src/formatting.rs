@@ -23,6 +23,15 @@ pub(crate) fn execution_report_last_message(report: &Value) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+pub(crate) fn primary_result_excerpt(value: &str) -> String {
+    let first_paragraph = value
+        .split("\n\n")
+        .map(str::trim)
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(value.trim());
+    truncate_text(first_paragraph, 600)
+}
+
 pub(crate) fn format_success_reply(
     job: &JobRecord,
     build_status: Option<&str>,
@@ -399,7 +408,7 @@ pub(crate) fn slugify(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::derive_job_title_from_message;
+    use super::{derive_job_title_from_message, primary_result_excerpt};
 
     #[test]
     fn title_synthesis_uses_concise_labels() {
@@ -408,6 +417,14 @@ mod tests {
                 "For repo `elowen-api`, update README.md by appending one sentence."
             ),
             "Update README"
+        );
+    }
+
+    #[test]
+    fn primary_result_excerpt_uses_first_paragraph_only() {
+        assert_eq!(
+            primary_result_excerpt("The answer is 42.\n\nExtra operational context."),
+            "The answer is 42."
         );
     }
 }
