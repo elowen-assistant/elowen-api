@@ -384,6 +384,19 @@ struct JobLifecycleEvent {
     created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JobApprovalCommand {
+    approval_id: String,
+    job_id: String,
+    short_id: String,
+    correlation_id: String,
+    device_id: String,
+    repo_name: String,
+    branch_name: String,
+    action_type: String,
+    approved_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
@@ -1250,6 +1263,13 @@ async fn resolve_approval(
     };
     let resolved_by = sanitize_optional_string(request.resolved_by);
     let reason = sanitize_optional_string(request.reason);
+    let existing_approval = load_approval_record(&state.pool, &approval_id).await?;
+    if existing_approval.status != "pending" {
+        return Err(AppError::conflict(anyhow::anyhow!(
+            "approval has already been resolved"
+        )));
+    }
+    let approval_job = load_job_record(&state.pool, &existing_approval.job_id).await?;
 
     let approval = sqlx::query_as::<_, ApprovalRecord>(
         r#"
@@ -1282,25 +1302,46 @@ async fn resolve_approval(
     .fetch_optional(&state.pool)
     .await?;
 
-    let approval = match approval {
-        Some(approval) => approval,
-        None => {
-            let existing = sqlx::query_scalar::<_, i64>(
-                "select count(*)::bigint from approvals where id = $1",
-            )
-            .bind(&approval_id)
-            .fetch_one(&state.pool)
-            .await?;
+    let approval = approval.ok_or_else(|| {
+        AppError::conflict(anyhow::anyhow!(
+            "approval could not be updated from pending state"
+        ))
+    })?;
 
-            if existing == 0 {
-                return Err(AppError::not_found(anyhow::anyhow!("approval not found")));
-            }
-
+    if status == "approved" && approval.action_type == "push" {
+        if approval_job.device_id.is_none() {
+            reset_approval_to_pending(&state.pool, &approval.id).await?;
             return Err(AppError::conflict(anyhow::anyhow!(
-                "approval has already been resolved"
+                "approved push job is missing an assigned device"
             )));
         }
-    };
+        if approval_job.branch_name.is_none() {
+            reset_approval_to_pending(&state.pool, &approval.id).await?;
+            return Err(AppError::conflict(anyhow::anyhow!(
+                "approved push job is missing a branch name"
+            )));
+        }
+        if let Err(error) =
+            publish_push_approval_command(&state.nats, &approval, &approval_job).await
+        {
+            reset_approval_to_pending(&state.pool, &approval.id).await?;
+            insert_job_event(
+                &state.pool,
+                &approval.job_id,
+                &approval_job.correlation_id,
+                "approval.dispatch_failed",
+                json!({
+                    "approval_id": approval.id,
+                    "action_type": approval.action_type,
+                    "error": error.error.to_string(),
+                }),
+            )
+            .await?;
+            return Err(AppError::from(anyhow::anyhow!(
+                "failed to publish approved push command"
+            )));
+        }
+    }
 
     let correlation_id = load_job_correlation_id(&state.pool, &approval.job_id).await?;
     insert_job_event(
@@ -1318,7 +1359,9 @@ async fn resolve_approval(
     )
     .await?;
 
-    update_job_status_only(&state.pool, &approval.job_id, "completed").await?;
+    if status == "rejected" || approval.action_type != "push" {
+        update_job_status_only(&state.pool, &approval.job_id, "completed").await?;
+    }
     touch_thread_for_job(&state.pool, &approval.job_id).await?;
 
     Ok(Json(approval))
@@ -1999,6 +2042,84 @@ async fn load_job_approvals(pool: &PgPool, job_id: &str) -> Result<Vec<ApprovalR
     .await?;
 
     Ok(approvals)
+}
+
+async fn load_approval_record(
+    pool: &PgPool,
+    approval_id: &str,
+) -> Result<ApprovalRecord, AppError> {
+    sqlx::query_as::<_, ApprovalRecord>(
+        r#"
+        select
+            id,
+            thread_id,
+            job_id,
+            action_type,
+            status,
+            summary,
+            resolved_by,
+            resolution_reason,
+            created_at,
+            resolved_at,
+            updated_at
+        from approvals
+        where id = $1
+        "#,
+    )
+    .bind(approval_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| AppError::not_found(anyhow::anyhow!("approval not found")))
+}
+
+async fn reset_approval_to_pending(pool: &PgPool, approval_id: &str) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        update approvals
+        set status = 'pending',
+            resolved_by = null,
+            resolution_reason = null,
+            resolved_at = null,
+            updated_at = now()
+        where id = $1
+        "#,
+    )
+    .bind(approval_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn publish_push_approval_command(
+    nats: &NatsClient,
+    approval: &ApprovalRecord,
+    job: &JobRecord,
+) -> Result<(), AppError> {
+    let device_id = job
+        .device_id
+        .as_deref()
+        .ok_or_else(|| AppError::conflict(anyhow::anyhow!("job device is missing")))?;
+    let branch_name = job
+        .branch_name
+        .as_deref()
+        .ok_or_else(|| AppError::conflict(anyhow::anyhow!("job branch is missing")))?;
+    let command = JobApprovalCommand {
+        approval_id: approval.id.clone(),
+        job_id: job.id.clone(),
+        short_id: job.short_id.clone(),
+        correlation_id: job.correlation_id.clone(),
+        device_id: device_id.to_string(),
+        repo_name: job.repo_name.clone(),
+        branch_name: branch_name.to_string(),
+        action_type: approval.action_type.clone(),
+        approved_at: Utc::now(),
+    };
+    let subject = format!("elowen.jobs.approvals.{device_id}");
+    let payload = serde_json::to_vec(&command).context("failed to serialize approval command")?;
+    nats.publish(subject, payload.into())
+        .await
+        .context("failed to publish approval command")?;
+    Ok(())
 }
 
 async fn load_related_thread_notes(
@@ -2689,6 +2810,23 @@ async fn build_thread_assistant_reply(
             format!(
                 "I started working on job `{}` for repo `{}` on device `{}`.",
                 job.short_id, job.repo_name, event.device_id
+            ),
+        )),
+        "job.push_started" => Some((
+            format!("job_event:{}:push_started", event.job_id),
+            format!(
+                "Push approval landed for job `{}`. I started pushing branch `{}` from device `{}`.",
+                job.short_id,
+                job.branch_name.as_deref().unwrap_or("unknown"),
+                event.device_id
+            ),
+        )),
+        "job.push_completed" => Some((
+            format!("job_event:{}:push_completed", event.job_id),
+            format!(
+                "I finished pushing branch `{}` for job `{}` to `origin`.",
+                job.branch_name.as_deref().unwrap_or("unknown"),
+                job.short_id
             ),
         )),
         "job.awaiting_approval" => {
