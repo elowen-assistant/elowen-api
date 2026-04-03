@@ -23,13 +23,18 @@ pub(crate) fn execution_report_last_message(report: &Value) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+pub(crate) fn sanitize_chat_result_text(value: &str) -> String {
+    let compact_links = compact_markdown_file_links(value.trim());
+    compact_disposable_worktree_paths(&compact_links)
+}
+
 pub(crate) fn primary_result_excerpt(value: &str) -> String {
     let first_paragraph = value
         .split("\n\n")
         .map(str::trim)
         .find(|segment| !segment.is_empty())
         .unwrap_or(value.trim());
-    truncate_text(first_paragraph, 600)
+    truncate_text(&sanitize_chat_result_text(first_paragraph), 600)
 }
 
 pub(crate) fn format_success_reply(
@@ -339,6 +344,58 @@ fn extract_backticked_filename(value: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn compact_markdown_file_links(value: &str) -> String {
+    let mut output = String::new();
+    let mut remainder = value;
+
+    while let Some(start) = remainder.find('[') {
+        output.push_str(&remainder[..start]);
+        let Some(label_end) = remainder[start + 1..].find("](") else {
+            output.push_str(&remainder[start..]);
+            return output;
+        };
+        let label_end = start + 1 + label_end;
+        let label = &remainder[start + 1..label_end];
+        let after_label = &remainder[label_end + 2..];
+        let Some(path_end) = after_label.find(')') else {
+            output.push_str(&remainder[start..]);
+            return output;
+        };
+        let path = &after_label[..path_end];
+        output.push_str(&format!("`{}`", compact_file_reference(label, path)));
+        remainder = &after_label[path_end + 1..];
+    }
+
+    output.push_str(remainder);
+    output
+}
+
+fn compact_disposable_worktree_paths(value: &str) -> String {
+    let mut sanitized = value.to_string();
+    for marker in [
+        "/.elowen/worktrees/",
+        "\\.elowen\\worktrees\\",
+        "/.elowen-sandbox/",
+        "\\.elowen-sandbox\\",
+    ] {
+        if !sanitized.contains(marker) {
+            continue;
+        }
+        sanitized = sanitized.replace('\\', "/");
+    }
+    sanitized
+}
+
+fn compact_file_reference(label: &str, path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    if let Some(file_name) = normalized.rsplit('/').next() {
+        if let Some((_, anchor)) = file_name.split_once('#') {
+            return format!("{label}#{anchor}");
+        }
+    }
+    label.to_string()
+}
+
 fn split_title_target(value: &str) -> &str {
     let lower = value.to_ascii_lowercase();
     let mut cutoff = value.len();
@@ -408,7 +465,7 @@ pub(crate) fn slugify(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_job_title_from_message, primary_result_excerpt};
+    use super::{derive_job_title_from_message, primary_result_excerpt, sanitize_chat_result_text};
 
     #[test]
     fn title_synthesis_uses_concise_labels() {
@@ -425,6 +482,16 @@ mod tests {
         assert_eq!(
             primary_result_excerpt("The answer is 42.\n\nExtra operational context."),
             "The answer is 42."
+        );
+    }
+
+    #[test]
+    fn sanitize_chat_result_text_compacts_markdown_file_links() {
+        assert_eq!(
+            sanitize_chat_result_text(
+                "The Cargo package name is `elowen-api`, from [Cargo.toml](D:/Projects/elowen/.elowen/worktrees/elowen-api/01knactp/Cargo.toml#L2)."
+            ),
+            "The Cargo package name is `elowen-api`, from `Cargo.toml#L2`."
         );
     }
 }

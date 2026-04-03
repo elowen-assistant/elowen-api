@@ -29,7 +29,8 @@ use formatting::{
     derive_job_title_from_message, execution_intent_note, execution_report_changed_entries,
     execution_report_last_message, execution_report_status, format_failure_reply,
     format_read_only_success_reply, format_success_reply, format_success_without_push_reply,
-    primary_result_excerpt, sanitize_optional_string, sanitize_string_list, slugify,
+    primary_result_excerpt, sanitize_chat_result_text, sanitize_optional_string,
+    sanitize_string_list, slugify,
 };
 use models::*;
 use state::{AppState, AssistantRuntime};
@@ -2723,6 +2724,7 @@ async fn build_thread_assistant_reply(
     let last_message = execution_report
         .as_ref()
         .and_then(|report| execution_report_last_message(report));
+    let sanitized_last_message = last_message.map(sanitize_chat_result_text);
     let execution_intent = execution_report
         .as_ref()
         .and_then(|report| report.get("execution_intent").cloned())
@@ -2785,10 +2787,10 @@ async fn build_thread_assistant_reply(
                 build_status,
                 test_status,
                 changed_entries,
-                last_message,
+                sanitized_last_message.as_deref(),
                 approval_summary,
             );
-            let content = if let Some(last_message) = last_message {
+            let content = if let Some(last_message) = sanitized_last_message.as_deref() {
                 format!(
                     "{}\n\nPush approval is pending.",
                     primary_result_excerpt(last_message)
@@ -2812,11 +2814,12 @@ async fn build_thread_assistant_reply(
                 build_status,
                 test_status,
                 changed_entries,
-                last_message,
+                sanitized_last_message.as_deref(),
             );
             Some((
                 format!("job_event:{}:completed", event.job_id),
-                last_message
+                sanitized_last_message
+                    .as_deref()
                     .map(primary_result_excerpt)
                     .unwrap_or_else(|| details.clone()),
                 make_completion_payload(details),
@@ -2836,11 +2839,12 @@ async fn build_thread_assistant_reply(
                 build_status,
                 test_status,
                 changed_entries,
-                last_message,
+                sanitized_last_message.as_deref(),
             );
             Some((
                 format!("job_event:{}:completed", event.job_id),
-                last_message
+                sanitized_last_message
+                    .as_deref()
                     .map(primary_result_excerpt)
                     .unwrap_or_else(|| details.clone()),
                 make_completion_payload(details),
