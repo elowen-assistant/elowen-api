@@ -3066,6 +3066,9 @@ async fn build_thread_assistant_reply(
     let changed_entries = execution_report
         .as_ref()
         .and_then(|report| execution_report_changed_entries(report));
+    let last_message = execution_report
+        .as_ref()
+        .and_then(|report| execution_report_last_message(report));
     let detail = event
         .detail
         .as_deref()
@@ -3114,6 +3117,7 @@ async fn build_thread_assistant_reply(
                     build_status,
                     test_status,
                     changed_entries,
+                    last_message,
                     approval_summary,
                 ),
             ))
@@ -3129,7 +3133,13 @@ async fn build_thread_assistant_reply(
         {
             Some((
                 format!("job_event:{}:completed", event.job_id),
-                format_success_without_push_reply(&job, build_status, test_status, changed_entries),
+                format_success_without_push_reply(
+                    &job,
+                    build_status,
+                    test_status,
+                    changed_entries,
+                    last_message,
+                ),
             ))
         }
         "job.completed" if event.result.as_deref() != Some("success") => Some((
@@ -3183,11 +3193,20 @@ fn execution_report_changed_entries(report: &Value) -> Option<usize> {
         .map(|items| items.len())
 }
 
+fn execution_report_last_message<'a>(report: &'a Value) -> Option<&'a str> {
+    report
+        .get("last_message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 fn format_success_reply(
     job: &JobRecord,
     build_status: Option<&str>,
     test_status: Option<&str>,
     changed_entries: Option<usize>,
+    last_message: Option<&str>,
     approval_summary: &str,
 ) -> String {
     let mut lines = vec![format!(
@@ -3207,6 +3226,11 @@ fn format_success_reply(
     if let Some(changed_entries) = changed_entries {
         lines.push(format!("Changed entries: {changed_entries}"));
     }
+    if let Some(last_message) = last_message {
+        lines.push(String::new());
+        lines.push("Final result:".to_string());
+        lines.push(truncate_text(last_message, 600));
+    }
 
     lines.push(String::new());
     lines.push(approval_summary.to_string());
@@ -3218,6 +3242,7 @@ fn format_success_without_push_reply(
     build_status: Option<&str>,
     test_status: Option<&str>,
     changed_entries: Option<usize>,
+    last_message: Option<&str>,
 ) -> String {
     let mut lines = vec![format!(
         "I finished job `{}` for repo `{}` successfully.",
@@ -3235,6 +3260,11 @@ fn format_success_without_push_reply(
     }
     if let Some(changed_entries) = changed_entries {
         lines.push(format!("Changed entries: {changed_entries}"));
+    }
+    if let Some(last_message) = last_message {
+        lines.push(String::new());
+        lines.push("Final result:".to_string());
+        lines.push(truncate_text(last_message, 600));
     }
 
     lines.push(String::new());
@@ -3450,22 +3480,159 @@ fn sanitize_optional_string(value: Option<String>) -> Option<String> {
 
 fn derive_job_title_from_message(content: &str) -> String {
     let trimmed = content.trim();
-    let mut title = trimmed
+    let first_line = trimmed
         .lines()
         .find(|line| !line.trim().is_empty())
         .unwrap_or("New coding task")
-        .trim()
-        .trim_end_matches(['.', '!', '?'])
-        .to_string();
+        .trim();
+    let normalized = normalize_title_input(first_line);
+    let lower = normalized.to_ascii_lowercase();
+    let action = extract_title_action(&lower);
+    let target = extract_title_target(&normalized, &lower);
+
+    let mut title = match (action.as_deref(), target.as_deref()) {
+        (Some(action), Some(target)) => format!("{action} {target}"),
+        (Some(action), None) => action.to_string(),
+        _ => normalized,
+    };
 
     if title.chars().count() > 72 {
         title = title.chars().take(72).collect::<String>();
     }
 
+    let title = title.trim().trim_end_matches(['.', '!', '?']).to_string();
     if title.is_empty() {
         "New coding task".to_string()
     } else {
         title
+    }
+}
+
+fn normalize_title_input(value: &str) -> String {
+    let mut normalized = value.trim().trim_end_matches(['.', '!', '?']).to_string();
+    for prefix in [
+        "For repo ",
+        "For repository ",
+        "In repo ",
+        "In repository ",
+        "Please ",
+        "Can you ",
+    ] {
+        if normalized.starts_with(prefix) {
+            normalized = normalized[prefix.len()..].trim_start().to_string();
+        }
+    }
+
+    if normalized.starts_with('`') {
+        if let Some(end) = normalized[1..].find('`') {
+            let remainder = normalized[(end + 2)..]
+                .trim_start_matches([',', ':', ' '])
+                .trim_start()
+                .to_string();
+            if !remainder.is_empty() {
+                normalized = remainder;
+            }
+        }
+    }
+
+    normalized
+}
+
+fn extract_title_action(lower: &str) -> Option<&'static str> {
+    [
+        ("append", "Update"),
+        ("update", "Update"),
+        ("edit", "Edit"),
+        ("fix", "Fix"),
+        ("implement", "Implement"),
+        ("add", "Add"),
+        ("remove", "Remove"),
+        ("create", "Create"),
+        ("refactor", "Refactor"),
+        ("review", "Review"),
+        ("document", "Document"),
+        ("investigate", "Investigate"),
+    ]
+    .iter()
+    .find_map(|(needle, label)| lower.contains(needle).then_some(*label))
+}
+
+fn extract_title_target(normalized: &str, lower: &str) -> Option<String> {
+    if let Some(target) = extract_backticked_filename(normalized) {
+        return Some(simplify_title_target(&target));
+    }
+
+    for needle in ["readme.md", "readme", "main.rs", "app.rs", "roadmap.md"] {
+        if lower.contains(needle) {
+            return Some(simplify_title_target(needle));
+        }
+    }
+
+    let action_index = [
+        "append",
+        "update",
+        "edit",
+        "fix",
+        "implement",
+        "add",
+        "remove",
+        "create",
+        "refactor",
+        "review",
+        "document",
+        "investigate",
+    ]
+    .iter()
+    .filter_map(|needle| lower.find(needle).map(|index| (index, *needle)))
+    .min_by_key(|(index, _)| *index)?;
+    let remainder = normalized[(action_index.0 + action_index.1.len())..].trim_start();
+    let target = split_title_target(remainder);
+    (!target.is_empty()).then(|| simplify_title_target(target))
+}
+
+fn extract_backticked_filename(value: &str) -> Option<String> {
+    value
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .find(|candidate| candidate.contains('.') || candidate.contains('/'))
+        .map(ToOwned::to_owned)
+}
+
+fn split_title_target(value: &str) -> &str {
+    let lower = value.to_ascii_lowercase();
+    let mut cutoff = value.len();
+    for marker in [
+        " by ",
+        " and ",
+        " with ",
+        " using ",
+        " so ",
+        ". ",
+        ", ",
+        "; ",
+        " make no other changes",
+    ] {
+        if let Some(index) = lower.find(marker) {
+            cutoff = cutoff.min(index);
+        }
+    }
+    value[..cutoff].trim()
+}
+
+fn simplify_title_target(value: &str) -> String {
+    let trimmed = value.trim().trim_matches('`');
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "readme.md" || lower == "readme" {
+        "README".to_string()
+    } else if lower.ends_with(".md") || lower.ends_with(".rs") || lower.ends_with(".toml") {
+        trimmed.to_string()
+    } else {
+        trimmed
+            .split_whitespace()
+            .take(6)
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
