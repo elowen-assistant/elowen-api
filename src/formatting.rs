@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use crate::models::{JobRecord, SummaryRecord};
+use crate::models::{ExecutionIntent, JobRecord, SummaryRecord};
 
 pub(crate) fn execution_report_status<'a>(report: &'a Value, key: &str) -> Option<&'a str> {
     report.get(key)?.get("status")?.as_str()
@@ -95,6 +95,58 @@ pub(crate) fn format_success_without_push_reply(
             .to_string(),
     );
     lines.join("\n")
+}
+
+pub(crate) fn format_read_only_success_reply(
+    job: &JobRecord,
+    build_status: Option<&str>,
+    test_status: Option<&str>,
+    changed_entries: Option<usize>,
+    last_message: Option<&str>,
+) -> String {
+    let mut lines = vec![format!(
+        "I finished read-only job `{}` for repo `{}` successfully.",
+        job.short_id, job.repo_name
+    )];
+
+    if let Some(branch_name) = &job.branch_name {
+        lines.push(format!("Branch: `{branch_name}`"));
+    }
+    if let Some(build_status) = build_status {
+        lines.push(format!("Build: {build_status}"));
+    }
+    if let Some(test_status) = test_status {
+        lines.push(format!("Test: {test_status}"));
+    }
+    if let Some(changed_entries) = changed_entries {
+        lines.push(format!("Changed entries: {changed_entries}"));
+    }
+    if let Some(last_message) = last_message {
+        lines.push(String::new());
+        lines.push("Final result:".to_string());
+        lines.push(truncate_text(last_message, 600));
+    }
+
+    lines.push(String::new());
+    match changed_entries.unwrap_or(0) {
+        0 => lines.push(
+            "This ran in read-only mode, so no repository changes were produced and no push approval was required."
+                .to_string(),
+        ),
+        _ => lines.push(
+            "This ran in read-only mode. Any tracked changes were left uncommitted in the disposable worktree, and no push approval was opened."
+                .to_string(),
+        ),
+    }
+
+    lines.join("\n")
+}
+
+pub(crate) fn execution_intent_note(intent: &ExecutionIntent) -> &'static str {
+    match intent {
+        ExecutionIntent::WorkspaceChange => "workspace-change",
+        ExecutionIntent::ReadOnly => "read-only",
+    }
 }
 
 pub(crate) fn format_failure_reply(

@@ -26,9 +26,10 @@ use ulid::Ulid;
 
 use error::AppError;
 use formatting::{
-    derive_job_title_from_message, execution_report_changed_entries, execution_report_last_message,
-    execution_report_status, format_failure_reply, format_success_reply,
-    format_success_without_push_reply, sanitize_optional_string, sanitize_string_list, slugify,
+    derive_job_title_from_message, execution_intent_note, execution_report_changed_entries,
+    execution_report_last_message, execution_report_status, format_failure_reply,
+    format_read_only_success_reply, format_success_reply, format_success_without_push_reply,
+    sanitize_optional_string, sanitize_string_list, slugify,
 };
 use models::*;
 use state::{AppState, AssistantRuntime};
@@ -377,6 +378,14 @@ async fn dispatch_thread_message(
                 .map(|draft| draft.base_branch.clone())
         })
         .unwrap_or_else(|| "main".to_string());
+    let execution_intent = request
+        .execution_intent
+        .or_else(|| {
+            embedded_draft
+                .as_ref()
+                .map(|draft| draft.execution_intent.clone())
+        })
+        .unwrap_or_else(|| infer_execution_intent(&request_text));
 
     let job = create_job_record(
         &state,
@@ -387,6 +396,7 @@ async fn dispatch_thread_message(
             base_branch: Some(base_branch),
             request_text: request_text.clone(),
             device_id: request.device_id,
+            execution_intent: Some(execution_intent.clone()),
         },
     )
     .await?;
@@ -395,11 +405,12 @@ async fn dispatch_thread_message(
         &thread_id,
         "system",
         &format!(
-            "Escalated {} message `{}` into job `{}` for repo `{}`.\nRequest summary: {}",
+            "Escalated {} message `{}` into job `{}` for repo `{}` in {} mode.\nRequest summary: {}",
             source_message.role,
             source_message.id,
             job.short_id,
             job.repo_name,
+            execution_intent_note(&execution_intent),
             summarize_text(&request_text, 160)
         ),
         "workflow.handoff.created",
@@ -443,6 +454,9 @@ async fn create_chat_dispatch(
         .unwrap_or_else(|| derive_job_title_from_message(content));
     let base_branch =
         sanitize_optional_string(request.base_branch).unwrap_or_else(|| "main".to_string());
+    let execution_intent = request
+        .execution_intent
+        .unwrap_or_else(|| infer_execution_intent(content));
 
     let message = insert_thread_message(&state.pool, &thread_id, "user", content).await?;
     let job = create_job_record(
@@ -454,6 +468,7 @@ async fn create_chat_dispatch(
             base_branch: Some(base_branch),
             request_text: content.to_string(),
             device_id: request.device_id,
+            execution_intent: Some(execution_intent.clone()),
         },
     )
     .await?;
@@ -462,13 +477,14 @@ async fn create_chat_dispatch(
         &thread_id,
         "system",
         &format!(
-            "Created job `{}` with status `{}` on device `{}` for repo `{}`.",
+            "Created job `{}` with status `{}` on device `{}` for repo `{}` in {} mode.",
             job.short_id,
             job.status,
             job.device_id
                 .clone()
                 .unwrap_or_else(|| "unassigned".to_string()),
-            job.repo_name
+            job.repo_name,
+            execution_intent_note(&execution_intent),
         ),
         "workflow.dispatch.created",
     )
@@ -518,6 +534,10 @@ async fn create_job_record(
     let request_text = request.request_text.trim();
     let base_branch =
         sanitize_optional_string(request.base_branch.clone()).unwrap_or_else(|| "main".to_string());
+    let execution_intent = request
+        .execution_intent
+        .clone()
+        .unwrap_or_else(|| infer_execution_intent(request_text));
 
     if title.is_empty() {
         return Err(AppError::bad_request(anyhow::anyhow!(
@@ -615,6 +635,7 @@ async fn create_job_record(
             "device_id": target_device_id,
             "base_branch": base_branch.clone(),
             "branch_name": branch_name.clone(),
+            "execution_intent": execution_intent,
         }),
     )
     .await?;
@@ -653,6 +674,7 @@ async fn create_job_record(
         base_branch: base_branch.clone(),
         branch_name: branch_name.clone(),
         request_text: request_text.to_string(),
+        execution_intent: execution_intent.clone(),
         dispatched_at: Utc::now(),
     };
     let dispatch_subject = format!("elowen.jobs.dispatch.{}", target_device.id);
@@ -703,6 +725,7 @@ async fn create_job_record(
             "repo_name": repo_name,
             "base_branch": base_branch.clone(),
             "branch_name": branch_name.clone(),
+            "execution_intent": execution_intent,
         }),
     )
     .await?;
@@ -1907,7 +1930,7 @@ fn build_conversation_instructions() -> &'static str {
 Reply conversationally and concisely. Use only the provided thread, job, and notes context. \
 Do not claim to have dispatched a laptop job, modified code, run tests, or inspected a worktree unless the context explicitly says that already happened. \
 When the user appears to want real code execution, planning, or repo changes, explain that execution happens through an explicit handoff into Workflow #1 and suggest using the dispatch controls when they are ready. \
-If a current execution draft is present, treat it as editable planning context and help refine it without pretending a job has already been dispatched. \
+If a current execution draft is present, treat it as editable planning context and help refine it without pretending a job has already been dispatched. Preserve a read-only draft as read-only unless the user clearly asks to make repository changes. \
 If the context is incomplete, say so plainly rather than inventing details. \
 When prior jobs, approvals, summaries, or notes materially support the answer, mention them briefly using labels like [Job 01abcd12] or [Note Title]."
 }
@@ -1982,10 +2005,11 @@ fn format_execution_draft_context(execution_draft: Option<&ExecutionDraft>) -> S
     };
 
     format!(
-        "- title `{}`; repo `{}`; branch `{}`; request {}; rationale {}",
+        "- title `{}`; repo `{}`; branch `{}`; intent `{}`; request {}; rationale {}",
         draft.title,
         draft.repo_name.as_deref().unwrap_or("unspecified"),
         draft.base_branch,
+        draft.execution_intent.as_str(),
         summarize_text(&draft.request_text, 220),
         summarize_text(&draft.rationale, 160),
     )
@@ -2218,6 +2242,55 @@ fn looks_like_execution_request(value: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+fn looks_like_read_only_request(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let explicit_read_only = [
+        "read-only",
+        "read only",
+        "do not modify",
+        "don't modify",
+        "do not change",
+        "don't change",
+        "no changes",
+        "without changing",
+        "without modifying",
+        "do not create commits",
+        "do not request push approval",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    let informational_request = [
+        "what ",
+        "which ",
+        "explain ",
+        "summarize ",
+        "summarise ",
+        "review ",
+        "inspect ",
+        "tell me ",
+        "report ",
+        "find ",
+        "identify ",
+        "show ",
+        "read ",
+        "where ",
+        "why ",
+        "how does ",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+
+    explicit_read_only || informational_request
+}
+
+fn infer_execution_intent(value: &str) -> ExecutionIntent {
+    if looks_like_read_only_request(value) {
+        ExecutionIntent::ReadOnly
+    } else {
+        ExecutionIntent::WorkspaceChange
+    }
+}
+
 fn looks_like_draft_refinement(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     [
@@ -2269,6 +2342,14 @@ fn maybe_build_execution_draft(
         })
         .or_else(|| jobs.first().and_then(|job| job.base_branch.clone()))
         .unwrap_or_else(|| "main".to_string());
+    let execution_intent = if !looks_like_execution_request(latest_text) {
+        previous_draft
+            .as_ref()
+            .map(|draft| draft.execution_intent.clone())
+            .unwrap_or_else(|| infer_execution_intent(latest_text))
+    } else {
+        infer_execution_intent(latest_text)
+    };
     let request_text = if let Some(previous_draft) = previous_draft.as_ref() {
         if !looks_like_execution_request(latest_text) && looks_like_draft_refinement(latest_text) {
             format!(
@@ -2292,6 +2373,8 @@ fn maybe_build_execution_draft(
     };
     let rationale = if previous_draft.is_some() && looks_like_draft_refinement(latest_text) {
         "Updated the draft using the latest conversational refinement.".to_string()
+    } else if matches!(execution_intent, ExecutionIntent::ReadOnly) {
+        "Prepared as a read-only repository investigation so the laptop can inspect and report without creating durable repo changes.".to_string()
     } else {
         "Prepared from the latest user request so it can be reviewed before dispatch.".to_string()
     };
@@ -2301,6 +2384,7 @@ fn maybe_build_execution_draft(
         repo_name,
         base_branch,
         request_text,
+        execution_intent,
         source_message_id: latest_user.id.clone(),
         source_role: latest_user.role.clone(),
         rationale,
@@ -2627,6 +2711,10 @@ async fn build_thread_assistant_reply(
     let last_message = execution_report
         .as_ref()
         .and_then(|report| execution_report_last_message(report));
+    let execution_intent = execution_report
+        .as_ref()
+        .and_then(|report| report.get("execution_intent").cloned())
+        .and_then(|value| serde_json::from_value::<ExecutionIntent>(value).ok());
     let detail = event
         .detail
         .as_deref()
@@ -2677,6 +2765,21 @@ async fn build_thread_assistant_reply(
                     changed_entries,
                     last_message,
                     approval_summary,
+                ),
+            ))
+        }
+        "job.completed"
+            if event.result.as_deref() == Some("success")
+                && matches!(execution_intent, Some(ExecutionIntent::ReadOnly)) =>
+        {
+            Some((
+                format!("job_event:{}:completed", event.job_id),
+                format_read_only_success_reply(
+                    &job,
+                    build_status,
+                    test_status,
+                    changed_entries,
+                    last_message,
                 ),
             ))
         }
