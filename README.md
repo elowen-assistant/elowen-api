@@ -11,3 +11,7 @@ Rust service responsible for thread/message APIs, job orchestration, device rout
 - provide orchestrator-side conversational replies in Workflow #2 when the assistant runtime is configured
 
 This scaffold is intentionally minimal. It gives the repo a clear entry point without locking framework details too early.
+
+## Verification
+
+Commit-gated push verification passed on 2026-04-03.
