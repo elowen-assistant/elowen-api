@@ -63,8 +63,20 @@ struct MessageRecord {
     role: String,
     content: String,
     status: String,
+    payload_json: Value,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExecutionDraft {
+    title: String,
+    repo_name: Option<String>,
+    base_branch: String,
+    request_text: String,
+    source_message_id: String,
+    source_role: String,
+    rationale: String,
 }
 
 #[derive(Debug, Serialize, Clone, FromRow)]
@@ -205,6 +217,7 @@ struct DispatchThreadMessageRequest {
     repo_name: String,
     base_branch: Option<String>,
     device_id: Option<String>,
+    request_text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -728,14 +741,24 @@ async fn create_thread_chat(
     let messages = load_thread_messages(&state.pool, &thread_id).await?;
     let jobs = load_thread_jobs(&state.pool, &thread_id).await?;
     let related_notes = load_related_thread_notes(&state, &thread, &messages, &jobs).await?;
-    let assistant_reply =
-        generate_conversational_reply(&state, &thread, &messages, &jobs, &related_notes).await?;
-    let assistant_message = insert_thread_message_with_status(
+    let execution_draft = maybe_build_execution_draft(&messages, &jobs);
+    let assistant_reply = generate_conversational_reply(
+        &state,
+        &thread,
+        &messages,
+        &jobs,
+        &related_notes,
+        execution_draft.as_ref(),
+    )
+    .await?;
+    let assistant_reply = maybe_annotate_draft_reply(assistant_reply, execution_draft.as_ref());
+    let assistant_message = insert_thread_message_with_status_and_payload(
         &state.pool,
         &thread_id,
         "assistant",
         &assistant_reply,
         "conversation.reply",
+        build_message_payload(execution_draft.as_ref()),
     )
     .await?;
 
@@ -757,13 +780,6 @@ async fn dispatch_thread_message(
 ) -> Result<(StatusCode, Json<MessageDispatchResponse>), AppError> {
     ensure_thread_exists(&state.pool, &thread_id).await?;
 
-    let repo_name = request.repo_name.trim();
-    if repo_name.is_empty() {
-        return Err(AppError::bad_request(anyhow::anyhow!(
-            "repo name is required"
-        )));
-    }
-
     let source_message =
         load_thread_message(&state.pool, &thread_id, request.source_message_id.trim()).await?;
     if !matches!(source_message.role.as_str(), "user" | "assistant") {
@@ -772,7 +788,14 @@ async fn dispatch_thread_message(
         )));
     }
 
-    let request_text = source_message.content.trim();
+    let embedded_draft = message_execution_draft(&source_message);
+    let request_text = sanitize_optional_string(request.request_text.clone())
+        .or_else(|| {
+            embedded_draft
+                .as_ref()
+                .map(|draft| draft.request_text.clone())
+        })
+        .unwrap_or_else(|| source_message.content.trim().to_string());
     if request_text.is_empty() {
         return Err(AppError::bad_request(anyhow::anyhow!(
             "source message content is required"
@@ -780,18 +803,31 @@ async fn dispatch_thread_message(
     }
 
     let title = sanitize_optional_string(request.title)
-        .unwrap_or_else(|| derive_job_title_from_message(request_text));
-    let base_branch =
-        sanitize_optional_string(request.base_branch).unwrap_or_else(|| "main".to_string());
+        .or_else(|| embedded_draft.as_ref().map(|draft| draft.title.clone()))
+        .unwrap_or_else(|| derive_job_title_from_message(&request_text));
+    let repo_name = sanitize_optional_string(Some(request.repo_name.clone()))
+        .or_else(|| {
+            embedded_draft
+                .as_ref()
+                .and_then(|draft| draft.repo_name.clone())
+        })
+        .ok_or_else(|| AppError::bad_request(anyhow::anyhow!("repo name is required")))?;
+    let base_branch = sanitize_optional_string(request.base_branch)
+        .or_else(|| {
+            embedded_draft
+                .as_ref()
+                .map(|draft| draft.base_branch.clone())
+        })
+        .unwrap_or_else(|| "main".to_string());
 
     let job = create_job_record(
         &state,
         &thread_id,
         &CreateJobRequest {
             title,
-            repo_name: repo_name.to_string(),
+            repo_name: repo_name.clone(),
             base_branch: Some(base_branch),
-            request_text: request_text.to_string(),
+            request_text: request_text.clone(),
             device_id: request.device_id,
         },
     )
@@ -806,7 +842,7 @@ async fn dispatch_thread_message(
             source_message.id,
             job.short_id,
             job.repo_name,
-            summarize_text(request_text, 160)
+            summarize_text(&request_text, 160)
         ),
         "workflow.handoff.created",
     )
@@ -1698,7 +1734,7 @@ async fn load_thread_messages(
 ) -> Result<Vec<MessageRecord>, AppError> {
     let messages = sqlx::query_as::<_, MessageRecord>(
         r#"
-        select id, thread_id, role, content, status, created_at, updated_at
+        select id, thread_id, role, content, status, payload_json, created_at, updated_at
         from messages
         where thread_id = $1
         order by created_at asc, id asc
@@ -1718,7 +1754,7 @@ async fn load_thread_message(
 ) -> Result<MessageRecord, AppError> {
     sqlx::query_as::<_, MessageRecord>(
         r#"
-        select id, thread_id, role, content, status, created_at, updated_at
+        select id, thread_id, role, content, status, payload_json, created_at, updated_at
         from messages
         where thread_id = $1 and id = $2
         "#,
@@ -2224,9 +2260,19 @@ async fn generate_conversational_reply(
     messages: &[MessageRecord],
     jobs: &[JobRecord],
     related_notes: &[NoteRecord],
+    execution_draft: Option<&ExecutionDraft>,
 ) -> Result<String, AppError> {
     if state.assistant.api_key.is_some() {
-        match request_assistant_reply(state, thread, messages, jobs, related_notes).await {
+        match request_assistant_reply(
+            state,
+            thread,
+            messages,
+            jobs,
+            related_notes,
+            execution_draft,
+        )
+        .await
+        {
             Ok(reply) => return Ok(reply),
             Err(error) => {
                 warn!(error = ?error, thread_id = %thread.id, "conversational assistant request failed; using fallback reply");
@@ -2239,6 +2285,7 @@ async fn generate_conversational_reply(
         messages,
         jobs,
         related_notes,
+        execution_draft,
     ))
 }
 
@@ -2248,6 +2295,7 @@ async fn request_assistant_reply(
     messages: &[MessageRecord],
     jobs: &[JobRecord],
     related_notes: &[NoteRecord],
+    execution_draft: Option<&ExecutionDraft>,
 ) -> Result<String, AppError> {
     let api_key = state
         .assistant
@@ -2262,7 +2310,15 @@ async fn request_assistant_reply(
         .json(&json!({
             "model": state.assistant.model,
             "instructions": build_conversation_instructions(),
-            "input": build_conversation_input(&state.pool, thread, messages, jobs, related_notes).await?,
+            "input": build_conversation_input(
+                &state.pool,
+                thread,
+                messages,
+                jobs,
+                related_notes,
+                execution_draft,
+            )
+            .await?,
             "max_output_tokens": 600,
         }))
         .send()
@@ -2293,6 +2349,7 @@ fn build_conversation_instructions() -> &'static str {
 Reply conversationally and concisely. Use only the provided thread, job, and notes context. \
 Do not claim to have dispatched a laptop job, modified code, run tests, or inspected a worktree unless the context explicitly says that already happened. \
 When the user appears to want real code execution, planning, or repo changes, explain that execution happens through an explicit handoff into Workflow #1 and suggest using the dispatch controls when they are ready. \
+If a current execution draft is present, treat it as editable planning context and help refine it without pretending a job has already been dispatched. \
 If the context is incomplete, say so plainly rather than inventing details. \
 When prior jobs, approvals, summaries, or notes materially support the answer, mention them briefly using labels like [Job 01abcd12] or [Note Title]."
 }
@@ -2303,6 +2360,7 @@ async fn build_conversation_input(
     messages: &[MessageRecord],
     jobs: &[JobRecord],
     related_notes: &[NoteRecord],
+    execution_draft: Option<&ExecutionDraft>,
 ) -> Result<String, AppError> {
     let latest_user = messages
         .iter()
@@ -2320,6 +2378,8 @@ Latest user message:\n{latest_user}\n\
 \n\
 Recent thread messages:\n{message_context}\n\
 \n\
+Current execution draft:\n{draft_context}\n\
+\n\
 Recent related jobs:\n{job_context}\n\
 \n\
 Related notes:\n{note_context}\n",
@@ -2327,6 +2387,7 @@ Related notes:\n{note_context}\n",
         status = thread.status,
         latest_user = latest_user,
         message_context = format_message_context(messages, 10),
+        draft_context = format_execution_draft_context(execution_draft),
         job_context = format_job_context(&job_context),
         note_context = format_note_context(related_notes, 4),
     ))
@@ -2355,6 +2416,21 @@ fn format_message_context(messages: &[MessageRecord], limit: usize) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn format_execution_draft_context(execution_draft: Option<&ExecutionDraft>) -> String {
+    let Some(draft) = execution_draft else {
+        return "- none".to_string();
+    };
+
+    format!(
+        "- title `{}`; repo `{}`; branch `{}`; request {}; rationale {}",
+        draft.title,
+        draft.repo_name.as_deref().unwrap_or("unspecified"),
+        draft.base_branch,
+        summarize_text(&draft.request_text, 220),
+        summarize_text(&draft.rationale, 160),
+    )
 }
 
 struct ConversationJobContext {
@@ -2440,7 +2516,9 @@ fn format_note_context(notes: &[NoteRecord], limit: usize) -> String {
 }
 
 fn format_message_mode_label(message: &MessageRecord) -> &'static str {
-    if message.status == "conversation.reply" {
+    if message.status == "conversation.reply" && message_execution_draft(message).is_some() {
+        "conversation-draft"
+    } else if message.status == "conversation.reply" {
         "conversation"
     } else if message.status == "workflow.handoff.created" {
         "handoff"
@@ -2451,6 +2529,24 @@ fn format_message_mode_label(message: &MessageRecord) -> &'static str {
     } else {
         "message"
     }
+}
+
+fn message_execution_draft(message: &MessageRecord) -> Option<ExecutionDraft> {
+    message
+        .payload_json
+        .get("execution_draft")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+fn build_message_payload(execution_draft: Option<&ExecutionDraft>) -> Value {
+    let Some(execution_draft) = execution_draft else {
+        return json!({});
+    };
+
+    json!({
+        "execution_draft": execution_draft,
+    })
 }
 
 fn extract_response_text(value: &Value) -> Option<String> {
@@ -2487,6 +2583,7 @@ fn build_fallback_conversational_reply(
     messages: &[MessageRecord],
     jobs: &[JobRecord],
     related_notes: &[NoteRecord],
+    execution_draft: Option<&ExecutionDraft>,
 ) -> String {
     let latest_user = messages
         .iter()
@@ -2509,6 +2606,14 @@ fn build_fallback_conversational_reply(
             "I’m in conversational mode for thread `{}` right now, so I have not created a laptop job yet. \
 I can help refine the request or you can use the explicit dispatch controls to hand this off into Workflow #1 when you’re ready.{}",
             thread.title, repo_hint
+        );
+    }
+
+    if let Some(draft) = execution_draft {
+        return format!(
+            "Iâ€™m still in conversational mode, and I prepared an execution draft for repo `{}` on branch `{}` from the latest request. You can keep refining it here before explicitly dispatching it into Workflow #1.",
+            draft.repo_name.as_deref().unwrap_or("unspecified"),
+            draft.base_branch
         );
     }
 
@@ -2553,6 +2658,156 @@ fn looks_like_execution_request(value: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+}
+
+fn looks_like_draft_refinement(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    [
+        "repo ",
+        "repository ",
+        "branch ",
+        "base branch",
+        "title ",
+        "call it ",
+        "rename ",
+        "instead",
+        "use ",
+        "send it",
+        "dispatch it",
+        "run it",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn maybe_build_execution_draft(
+    messages: &[MessageRecord],
+    jobs: &[JobRecord],
+) -> Option<ExecutionDraft> {
+    let latest_user = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")?;
+    let latest_text = latest_user.content.trim();
+    let previous_draft = messages.iter().rev().find_map(message_execution_draft);
+    let should_draft = looks_like_execution_request(latest_text)
+        || (previous_draft.is_some() && looks_like_draft_refinement(latest_text));
+    if !should_draft {
+        return None;
+    }
+
+    let repo_name = extract_repo_hint(latest_text)
+        .or_else(|| {
+            previous_draft
+                .as_ref()
+                .and_then(|draft| draft.repo_name.clone())
+        })
+        .or_else(|| jobs.first().map(|job| job.repo_name.clone()));
+    let base_branch = extract_base_branch_hint(latest_text)
+        .or_else(|| {
+            previous_draft
+                .as_ref()
+                .map(|draft| draft.base_branch.clone())
+        })
+        .or_else(|| jobs.first().and_then(|job| job.base_branch.clone()))
+        .unwrap_or_else(|| "main".to_string());
+    let request_text = if let Some(previous_draft) = previous_draft.as_ref() {
+        if !looks_like_execution_request(latest_text) && looks_like_draft_refinement(latest_text) {
+            format!(
+                "{}\n\nRefinement: {}",
+                previous_draft.request_text.trim(),
+                latest_text
+            )
+        } else {
+            latest_text.to_string()
+        }
+    } else {
+        latest_text.to_string()
+    };
+    let title = if !looks_like_execution_request(latest_text) {
+        previous_draft
+            .as_ref()
+            .map(|draft| draft.title.clone())
+            .unwrap_or_else(|| derive_job_title_from_message(&request_text))
+    } else {
+        derive_job_title_from_message(&request_text)
+    };
+    let rationale = if previous_draft.is_some() && looks_like_draft_refinement(latest_text) {
+        "Updated the draft using the latest conversational refinement.".to_string()
+    } else {
+        "Prepared from the latest user request so it can be reviewed before dispatch.".to_string()
+    };
+
+    Some(ExecutionDraft {
+        title,
+        repo_name,
+        base_branch,
+        request_text,
+        source_message_id: latest_user.id.clone(),
+        source_role: latest_user.role.clone(),
+        rationale,
+    })
+}
+
+fn extract_repo_hint(value: &str) -> Option<String> {
+    extract_backticked_hint(value, "repo")
+        .or_else(|| extract_backticked_hint(value, "repository"))
+        .or_else(|| extract_keyword_value(value, "repo"))
+        .or_else(|| extract_keyword_value(value, "repository"))
+}
+
+fn extract_base_branch_hint(value: &str) -> Option<String> {
+    extract_backticked_hint(value, "base branch")
+        .or_else(|| extract_backticked_hint(value, "branch"))
+        .or_else(|| extract_keyword_value(value, "base branch"))
+        .or_else(|| extract_keyword_value(value, "branch"))
+}
+
+fn extract_backticked_hint(value: &str, prefix: &str) -> Option<String> {
+    let lower = value.to_ascii_lowercase();
+    let pattern = format!("{prefix} `");
+    let start = lower.find(&pattern)?;
+    let original = &value[start + pattern.len()..];
+    let end = original.find('`')?;
+    sanitize_optional_string(Some(original[..end].to_string()))
+}
+
+fn extract_keyword_value(value: &str, prefix: &str) -> Option<String> {
+    let lower = value.to_ascii_lowercase();
+    let start = lower.find(prefix)?;
+    let original = value[start + prefix.len()..].trim_start_matches([' ', ':']);
+    let token = original
+        .split_whitespace()
+        .next()
+        .map(|part| {
+            part.trim_matches(|ch: char| {
+                ch == ',' || ch == '.' || ch == ';' || ch == ':' || ch == ')' || ch == '('
+            })
+        })
+        .unwrap_or_default();
+    sanitize_optional_string(Some(token.to_string()))
+}
+
+fn maybe_annotate_draft_reply(reply: String, execution_draft: Option<&ExecutionDraft>) -> String {
+    let Some(execution_draft) = execution_draft else {
+        return reply;
+    };
+
+    let trimmed = reply.trim();
+    if trimmed.is_empty() {
+        return format!(
+            "I prepared an execution draft for repo `{}` on branch `{}`. Review it below before dispatching it into Workflow #1.",
+            execution_draft
+                .repo_name
+                .as_deref()
+                .unwrap_or("unspecified"),
+            execution_draft.base_branch
+        );
+    }
+
+    format!(
+        "{trimmed}\n\nI also drafted an execution handoff below so you can review and refine it before dispatching it into Workflow #1."
+    )
 }
 
 fn merge_note_sets(primary: Vec<NoteRecord>, secondary: Vec<NoteRecord>) -> Vec<NoteRecord> {
@@ -2702,12 +2957,24 @@ async fn insert_thread_message_with_status(
     content: &str,
     status: &str,
 ) -> Result<MessageRecord, AppError> {
+    insert_thread_message_with_status_and_payload(pool, thread_id, role, content, status, json!({}))
+        .await
+}
+
+async fn insert_thread_message_with_status_and_payload(
+    pool: &PgPool,
+    thread_id: &str,
+    role: &str,
+    content: &str,
+    status: &str,
+    payload_json: Value,
+) -> Result<MessageRecord, AppError> {
     let message_id = Ulid::new().to_string();
     let message = sqlx::query_as::<_, MessageRecord>(
         r#"
-        insert into messages (id, thread_id, role, content, status)
-        values ($1, $2, $3, $4, $5)
-        returning id, thread_id, role, content, status, created_at, updated_at
+        insert into messages (id, thread_id, role, content, status, payload_json)
+        values ($1, $2, $3, $4, $5, $6)
+        returning id, thread_id, role, content, status, payload_json, created_at, updated_at
         "#,
     )
     .bind(&message_id)
@@ -2715,6 +2982,7 @@ async fn insert_thread_message_with_status(
     .bind(role)
     .bind(content)
     .bind(status)
+    .bind(SqlxJson(payload_json))
     .fetch_one(pool)
     .await?;
 
