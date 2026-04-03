@@ -2850,6 +2850,20 @@ async fn build_thread_assistant_reply(
                 ),
             ))
         }
+        "job.completed"
+            if event.result.as_deref() == Some("success")
+                && !event
+                    .payload_json
+                    .as_ref()
+                    .and_then(|payload| payload.get("push_required"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false) =>
+        {
+            Some((
+                format!("job_event:{}:completed", event.job_id),
+                format_success_without_push_reply(&job, build_status, test_status, changed_entries),
+            ))
+        }
         "job.completed" if event.result.as_deref() != Some("success") => Some((
             format!("job_event:{}:completed", event.job_id),
             format_failure_reply(
@@ -2928,6 +2942,38 @@ fn format_success_reply(
 
     lines.push(String::new());
     lines.push(approval_summary.to_string());
+    lines.join("\n")
+}
+
+fn format_success_without_push_reply(
+    job: &JobRecord,
+    build_status: Option<&str>,
+    test_status: Option<&str>,
+    changed_entries: Option<usize>,
+) -> String {
+    let mut lines = vec![format!(
+        "I finished job `{}` for repo `{}` successfully.",
+        job.short_id, job.repo_name
+    )];
+
+    if let Some(branch_name) = &job.branch_name {
+        lines.push(format!("Branch: `{branch_name}`"));
+    }
+    if let Some(build_status) = build_status {
+        lines.push(format!("Build: {build_status}"));
+    }
+    if let Some(test_status) = test_status {
+        lines.push(format!("Test: {test_status}"));
+    }
+    if let Some(changed_entries) = changed_entries {
+        lines.push(format!("Changed entries: {changed_entries}"));
+    }
+
+    lines.push(String::new());
+    lines.push(
+        "No committed repository changes were produced, so no push approval was required."
+            .to_string(),
+    );
     lines.join("\n")
 }
 
