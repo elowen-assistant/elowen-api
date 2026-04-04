@@ -9,12 +9,16 @@ use anyhow::Context;
 use async_nats::Client as NatsClient;
 use axum::{
     Json, Router,
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{Path, Request, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware::{self, Next},
+    response::Response,
     routing::{get, post},
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
+use rand::RngCore;
 use reqwest::Client as HttpClient;
 use serde_json::{Value, json};
 use sqlx::{PgPool, postgres::PgPoolOptions, types::Json as SqlxJson};
@@ -33,7 +37,7 @@ use formatting::{
     sanitize_string_list, slugify,
 };
 use models::*;
-use state::{AppState, AssistantRuntime};
+use state::{AppState, AssistantRuntime, AuthRuntime};
 
 fn init_tracing(service_name: &'static str) {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -80,6 +84,22 @@ pub async fn run() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "https://api.openai.com/v1".to_string())
         .trim_end_matches('/')
         .to_string();
+    let auth_password = env::var("ELOWEN_UI_PASSWORD")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let auth_operator_label = env::var("ELOWEN_UI_OPERATOR_LABEL")
+        .unwrap_or_else(|_| "Operator".to_string())
+        .trim()
+        .to_string();
+    let auth_cookie_name = env::var("ELOWEN_UI_COOKIE_NAME")
+        .unwrap_or_else(|_| "elowen_session".to_string())
+        .trim()
+        .to_string();
+    let auth_session_days = env::var("ELOWEN_UI_SESSION_DAYS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(14);
 
     let pool = PgPoolOptions::new()
         .max_connections(5)
@@ -113,45 +133,65 @@ pub async fn run() -> anyhow::Result<()> {
         .unwrap_or(8080);
     let address = SocketAddr::from(([0, 0, 0, 0], port));
 
-    let app = Router::new()
-        .route("/health", get(|| async { "ok" }))
-        .route("/api/v1/threads", get(list_threads).post(create_thread))
-        .route("/api/v1/threads/{thread_id}", get(get_thread))
-        .route("/api/v1/threads/{thread_id}/messages", post(create_message))
-        .route("/api/v1/threads/{thread_id}/chat", post(create_thread_chat))
+    let state = AppState {
+        pool,
+        nats,
+        http,
+        notes_url,
+        assistant: AssistantRuntime {
+            api_key: assistant_api_key,
+            model: assistant_model,
+            base_url: assistant_base_url,
+        },
+        auth: AuthRuntime {
+            password: auth_password,
+            operator_label: auth_operator_label,
+            cookie_name: auth_cookie_name,
+            session_ttl: Duration::from_secs(auth_session_days * 24 * 60 * 60),
+        },
+    };
+
+    let protected_api = Router::new()
+        .route("/threads", get(list_threads).post(create_thread))
+        .route("/threads/{thread_id}", get(get_thread))
+        .route("/threads/{thread_id}/messages", post(create_message))
+        .route("/threads/{thread_id}/chat", post(create_thread_chat))
         .route(
-            "/api/v1/threads/{thread_id}/message-dispatch",
+            "/threads/{thread_id}/message-dispatch",
             post(dispatch_thread_message),
         )
         .route(
-            "/api/v1/threads/{thread_id}/chat-dispatch",
+            "/threads/{thread_id}/chat-dispatch",
             post(create_chat_dispatch),
         )
-        .route("/api/v1/threads/{thread_id}/notes", get(get_thread_notes))
+        .route("/threads/{thread_id}/notes", get(get_thread_notes))
         .route(
-            "/api/v1/threads/{thread_id}/jobs",
+            "/threads/{thread_id}/jobs",
             get(list_thread_jobs).post(create_job),
         )
-        .route("/api/v1/jobs", get(list_jobs))
-        .route("/api/v1/jobs/{job_id}", get(get_job))
-        .route("/api/v1/jobs/{job_id}/notes", get(get_job_notes))
+        .route("/jobs", get(list_jobs))
+        .route("/jobs/{job_id}", get(get_job))
+        .route("/jobs/{job_id}/notes", get(get_job_notes))
+        .route("/jobs/{job_id}/notes/promote", post(promote_job_note))
+        .route("/approvals/{approval_id}/resolve", post(resolve_approval))
+        .route("/devices", get(list_devices))
+        .route("/devices/{device_id}", get(get_device).put(register_device))
         .route(
-            "/api/v1/jobs/{job_id}/notes/promote",
-            post(promote_job_note),
-        )
-        .route(
-            "/api/v1/approvals/{approval_id}/resolve",
-            post(resolve_approval),
-        )
-        .route("/api/v1/devices", get(list_devices))
-        .route(
-            "/api/v1/devices/{device_id}",
-            get(get_device).put(register_device),
-        )
-        .route(
-            "/api/v1/devices/{device_id}/availability-probe",
+            "/devices/{device_id}/availability-probe",
             post(probe_device),
         )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_authenticated_session,
+        ))
+        .with_state(state.clone());
+
+    let app = Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .route("/api/v1/auth/session", get(get_auth_session))
+        .route("/api/v1/auth/login", post(login))
+        .route("/api/v1/auth/logout", post(logout))
+        .nest("/api/v1", protected_api)
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -162,23 +202,196 @@ pub async fn run() -> anyhow::Result<()> {
                 ])
                 .allow_headers(Any),
         )
-        .with_state(AppState {
-            pool,
-            nats,
-            http,
-            notes_url,
-            assistant: AssistantRuntime {
-                api_key: assistant_api_key,
-                model: assistant_model,
-                base_url: assistant_base_url,
-            },
-        });
+        .with_state(state);
 
     info!(%address, "starting elowen-api");
 
     let listener = tokio::net::TcpListener::bind(address).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn get_auth_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AuthSessionStatus>, AppError> {
+    purge_expired_sessions(&state.pool).await?;
+
+    let operator_label =
+        current_session_operator_label(&state.pool, &state.auth.cookie_name, &headers).await?;
+
+    Ok(Json(AuthSessionStatus {
+        enabled: state.auth.enabled(),
+        authenticated: operator_label.is_some() || !state.auth.enabled(),
+        operator_label,
+    }))
+}
+
+async fn login(
+    State(state): State<AppState>,
+    Json(request): Json<LoginRequest>,
+) -> Result<(StatusCode, HeaderMap, Json<AuthSessionStatus>), AppError> {
+    let expected_password =
+        state.auth.password.as_ref().ok_or_else(|| {
+            AppError::conflict(anyhow::anyhow!("web UI authentication is disabled"))
+        })?;
+
+    if request.password != *expected_password {
+        return Err(AppError::unauthorized(anyhow::anyhow!("invalid password")));
+    }
+
+    purge_expired_sessions(&state.pool).await?;
+
+    let token = new_session_token();
+    let expires_at = Utc::now()
+        + chrono::Duration::from_std(state.auth.session_ttl)
+            .map_err(|error| AppError::from(anyhow::anyhow!(error)))?;
+
+    sqlx::query(
+        r#"
+        insert into ui_sessions (token, operator_label, expires_at)
+        values ($1, $2, $3)
+        "#,
+    )
+    .bind(&token)
+    .bind(&state.auth.operator_label)
+    .bind(expires_at)
+    .execute(&state.pool)
+    .await?;
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&session_cookie_value(
+            &state.auth.cookie_name,
+            Some(&token),
+            Some(state.auth.session_ttl),
+        ))
+        .map_err(AppError::from)?,
+    );
+
+    Ok((
+        StatusCode::OK,
+        headers,
+        Json(AuthSessionStatus {
+            enabled: true,
+            authenticated: true,
+            operator_label: Some(state.auth.operator_label.clone()),
+        }),
+    ))
+}
+
+async fn logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, HeaderMap, Json<AuthSessionStatus>), AppError> {
+    if let Some(token) = session_token_from_headers(&state.auth.cookie_name, &headers) {
+        sqlx::query("delete from ui_sessions where token = $1")
+            .bind(token)
+            .execute(&state.pool)
+            .await?;
+    }
+
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&session_cookie_value(&state.auth.cookie_name, None, None))
+            .map_err(AppError::from)?,
+    );
+
+    Ok((
+        StatusCode::OK,
+        response_headers,
+        Json(AuthSessionStatus {
+            enabled: state.auth.enabled(),
+            authenticated: false,
+            operator_label: None,
+        }),
+    ))
+}
+
+async fn require_authenticated_session(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    if !state.auth.enabled() {
+        return Ok(next.run(request).await);
+    }
+
+    purge_expired_sessions(&state.pool).await?;
+
+    let authenticated =
+        current_session_operator_label(&state.pool, &state.auth.cookie_name, request.headers())
+            .await?
+            .is_some();
+
+    if !authenticated {
+        return Err(AppError::unauthorized(anyhow::anyhow!("sign in required")));
+    }
+
+    Ok(next.run(request).await)
+}
+
+async fn current_session_operator_label(
+    pool: &PgPool,
+    cookie_name: &str,
+    headers: &HeaderMap,
+) -> Result<Option<String>, AppError> {
+    let Some(token) = session_token_from_headers(cookie_name, headers) else {
+        return Ok(None);
+    };
+
+    let operator_label = sqlx::query_scalar::<_, String>(
+        r#"
+        select operator_label
+        from ui_sessions
+        where token = $1
+          and expires_at > now()
+        "#,
+    )
+    .bind(token)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(operator_label)
+}
+
+async fn purge_expired_sessions(pool: &PgPool) -> Result<(), AppError> {
+    sqlx::query("delete from ui_sessions where expires_at <= now()")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+fn new_session_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn session_cookie_value(
+    cookie_name: &str,
+    token: Option<&str>,
+    max_age: Option<Duration>,
+) -> String {
+    match (token, max_age) {
+        (Some(token), Some(max_age)) => format!(
+            "{cookie_name}={token}; HttpOnly; Path=/; SameSite=Strict; Max-Age={}",
+            max_age.as_secs()
+        ),
+        _ => format!("{cookie_name}=; HttpOnly; Path=/; SameSite=Strict; Max-Age=0"),
+    }
+}
+
+fn session_token_from_headers<'a>(cookie_name: &str, headers: &'a HeaderMap) -> Option<&'a str> {
+    let raw_cookie = headers.get(header::COOKIE)?.to_str().ok()?;
+
+    raw_cookie.split(';').find_map(|segment| {
+        let trimmed = segment.trim();
+        let (name, value) = trimmed.split_once('=')?;
+        (name == cookie_name).then_some(value)
+    })
 }
 
 async fn list_threads(State(state): State<AppState>) -> Result<Json<Vec<ThreadSummary>>, AppError> {

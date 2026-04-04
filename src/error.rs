@@ -42,6 +42,13 @@ impl AppError {
         }
     }
 
+    pub(crate) fn unauthorized(message: impl Into<anyhow::Error>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            error: message.into(),
+        }
+    }
+
     pub(crate) fn gateway_timeout(message: impl Into<anyhow::Error>) -> Self {
         Self {
             status: StatusCode::GATEWAY_TIMEOUT,

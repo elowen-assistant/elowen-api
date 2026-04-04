@@ -403,3 +403,15 @@ pub(crate) struct JobApprovalCommand {
     pub(crate) action_type: String,
     pub(crate) approved_at: DateTime<Utc>,
 }
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct LoginRequest {
+    pub(crate) password: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct AuthSessionStatus {
+    pub(crate) enabled: bool,
+    pub(crate) authenticated: bool,
+    pub(crate) operator_label: Option<String>,
+}
