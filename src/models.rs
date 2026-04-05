@@ -299,6 +299,10 @@ pub(crate) struct RegisterDeviceRequest {
     #[serde(default)]
     pub(crate) allowed_repos: Vec<String>,
     #[serde(default)]
+    pub(crate) allowed_repo_roots: Vec<String>,
+    #[serde(default)]
+    pub(crate) discovered_repos: Vec<String>,
+    #[serde(default)]
     pub(crate) capabilities: Vec<String>,
 }
 
@@ -322,6 +326,10 @@ pub(crate) struct DeviceMetadata {
     #[serde(default)]
     pub(crate) allowed_repos: Vec<String>,
     #[serde(default)]
+    pub(crate) allowed_repo_roots: Vec<String>,
+    #[serde(default)]
+    pub(crate) discovered_repos: Vec<String>,
+    #[serde(default)]
     pub(crate) capabilities: Vec<String>,
     pub(crate) registered_at: Option<DateTime<Utc>>,
     pub(crate) last_seen_at: Option<DateTime<Utc>>,
@@ -344,6 +352,8 @@ pub(crate) struct DeviceRecord {
     pub(crate) name: String,
     pub(crate) primary_flag: bool,
     pub(crate) allowed_repos: Vec<String>,
+    pub(crate) allowed_repo_roots: Vec<String>,
+    pub(crate) discovered_repos: Vec<String>,
     pub(crate) capabilities: Vec<String>,
     pub(crate) registered_at: DateTime<Utc>,
     pub(crate) last_seen_at: DateTime<Utc>,

@@ -1246,6 +1246,8 @@ async fn register_device(
 
     let metadata = DeviceMetadata {
         allowed_repos: sanitize_string_list(request.allowed_repos),
+        allowed_repo_roots: sanitize_string_list(request.allowed_repo_roots),
+        discovered_repos: sanitize_string_list(request.discovered_repos),
         capabilities: sanitize_string_list(request.capabilities),
         registered_at: existing
             .as_ref()
@@ -3155,7 +3157,12 @@ async fn select_dispatch_device(
 }
 
 fn ensure_repo_allowed(device: &DeviceRecord, repo_name: &str) -> Result<(), AppError> {
-    if device.allowed_repos.is_empty() || device.allowed_repos.iter().any(|repo| repo == repo_name)
+    if !device_has_repo_scope(device) {
+        return Ok(());
+    }
+
+    if device.allowed_repos.iter().any(|repo| repo == repo_name)
+        || device.discovered_repos.iter().any(|repo| repo == repo_name)
     {
         return Ok(());
     }
@@ -3163,6 +3170,12 @@ fn ensure_repo_allowed(device: &DeviceRecord, repo_name: &str) -> Result<(), App
     Err(AppError::bad_request(anyhow::anyhow!(
         "device is not allowed to run the requested repository"
     )))
+}
+
+fn device_has_repo_scope(device: &DeviceRecord) -> bool {
+    !device.allowed_repos.is_empty()
+        || !device.allowed_repo_roots.is_empty()
+        || !device.discovered_repos.is_empty()
 }
 
 async fn load_device_row(pool: &PgPool, device_id: &str) -> Result<DeviceRow, AppError> {
@@ -3228,12 +3241,57 @@ fn device_record_from_row(row: DeviceRow) -> DeviceRecord {
         name: row.name,
         primary_flag: row.primary_flag,
         allowed_repos: metadata.allowed_repos,
+        allowed_repo_roots: metadata.allowed_repo_roots,
+        discovered_repos: metadata.discovered_repos,
         capabilities: metadata.capabilities,
         registered_at,
         last_seen_at,
         last_probe: metadata.last_probe,
         created_at: row.created_at,
         updated_at: row.updated_at,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{device_has_repo_scope, ensure_repo_allowed};
+    use crate::models::DeviceRecord;
+    use chrono::Utc;
+
+    fn sample_device() -> DeviceRecord {
+        let now = Utc::now();
+        DeviceRecord {
+            id: "device-1".to_string(),
+            name: "Elowen Laptop".to_string(),
+            primary_flag: true,
+            allowed_repos: Vec::new(),
+            allowed_repo_roots: Vec::new(),
+            discovered_repos: Vec::new(),
+            capabilities: vec!["codex".to_string()],
+            registered_at: now,
+            last_seen_at: now,
+            last_probe: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn devices_without_repo_scope_remain_unrestricted() {
+        let device = sample_device();
+        assert!(!device_has_repo_scope(&device));
+        assert!(ensure_repo_allowed(&device, "any-repo").is_ok());
+    }
+
+    #[test]
+    fn discovered_repo_allows_dispatch() {
+        let mut device = sample_device();
+        device.allowed_repo_roots = vec!["D:\\Projects".to_string()];
+        device.discovered_repos = vec!["elowen-api".to_string()];
+
+        assert!(device_has_repo_scope(&device));
+        assert!(ensure_repo_allowed(&device, "elowen-api").is_ok());
+        assert!(ensure_repo_allowed(&device, "other-repo").is_err());
     }
 }
 
