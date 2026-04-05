@@ -13,7 +13,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::Response,
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
@@ -151,6 +151,8 @@ pub async fn run() -> anyhow::Result<()> {
         },
     };
 
+    let public_api = Router::new().route("/devices/{device_id}", put(register_device));
+
     let protected_api = Router::new()
         .route("/threads", get(list_threads).post(create_thread))
         .route("/threads/{thread_id}", get(get_thread))
@@ -175,7 +177,7 @@ pub async fn run() -> anyhow::Result<()> {
         .route("/jobs/{job_id}/notes/promote", post(promote_job_note))
         .route("/approvals/{approval_id}/resolve", post(resolve_approval))
         .route("/devices", get(list_devices))
-        .route("/devices/{device_id}", get(get_device).put(register_device))
+        .route("/devices/{device_id}", get(get_device))
         .route(
             "/devices/{device_id}/availability-probe",
             post(probe_device),
@@ -191,6 +193,7 @@ pub async fn run() -> anyhow::Result<()> {
         .route("/api/v1/auth/session", get(get_auth_session))
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/logout", post(logout))
+        .nest("/api/v1", public_api)
         .nest("/api/v1", protected_api)
         .layer(
             CorsLayer::new()
