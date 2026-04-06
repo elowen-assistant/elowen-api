@@ -1,13 +1,41 @@
 # elowen-api
 
-Rust service responsible for thread/message APIs, job orchestration, device routing, approvals, and summary coordination.
+Rust orchestrator service responsible for Elowen's thread, job, device, approval, authentication, and realtime state APIs.
 
-## Initial Scope
+## Current Responsibilities
 
-- expose thread and job HTTP APIs
-- coordinate job lifecycle state
-- dispatch work over NATS JetStream
+- expose thread, message, job, approval, device, note, and authentication HTTP APIs
+- provide orchestrator-side conversational replies for Workflow #2 when the OpenAI runtime is configured
+- generate and persist execution drafts that can be promoted into laptop-backed jobs
+- coordinate explicit handoff from conversational chat into real edge execution
+- dispatch jobs and approval commands over NATS
 - persist operational state in Postgres
-- provide orchestrator-side conversational replies in Workflow #2 when the assistant runtime is configured
+- consume edge lifecycle events and publish thread/job/device changes to the UI over authenticated server-sent events
+- integrate with `elowen-notes` for thread and job context
+- enforce web UI session authentication when configured
+- issue signed registration challenges and verify edge-signed registration proofs for trusted edge registration
 
-This scaffold is intentionally minimal. It gives the repo a clear entry point without locking framework details too early.
+## Runtime Notes
+
+The VPS deployment runs `elowen-api` from a prebuilt GHCR image rather than compiling on the server. Local development still uses normal Cargo workflows.
+
+Important environment variables include:
+
+- `DATABASE_URL`
+- `NATS_URL`
+- `ELOWEN_NOTES_URL`
+- `OPENAI_API_KEY`
+- `ELOWEN_UI_PASSWORD`
+- `ELOWEN_ORCHESTRATOR_SIGNING_KEY`
+- `ELOWEN_REQUIRE_TRUSTED_EDGE_REGISTRATION`
+
+## Verification
+
+Useful local checks:
+
+```bash
+cargo fmt --check
+cargo test --quiet
+cargo clippy --all-targets -- -D warnings
+cargo doc --no-deps
+```
