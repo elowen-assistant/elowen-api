@@ -1053,6 +1053,10 @@ async fn create_job_record(
             }),
         )
         .await?;
+        publish_ui_event(
+            state,
+            job_ui_event(thread_id, &job_id, Some(target_device.id.as_str())),
+        );
         return Err(AppError::from(anyhow::anyhow!(
             "failed to publish job dispatch"
         )));
@@ -1206,6 +1210,11 @@ async fn promote_job_note(
         },
     )
     .await?;
+
+    publish_ui_event(
+        &state,
+        job_ui_event(&job.thread_id, &job.id, job.device_id.as_deref()),
+    );
 
     Ok((StatusCode::CREATED, Json(promoted)))
 }
@@ -1490,6 +1499,8 @@ async fn probe_device(
         metadata,
     )
     .await?;
+
+    publish_ui_event(&state, device_ui_event(&device.id));
 
     Ok(Json(response))
 }
