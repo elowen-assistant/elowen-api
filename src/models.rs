@@ -304,6 +304,27 @@ pub(crate) struct RegisterDeviceRequest {
     pub(crate) discovered_repos: Vec<String>,
     #[serde(default)]
     pub(crate) capabilities: Vec<String>,
+    #[serde(default)]
+    pub(crate) trust: Option<DeviceRegistrationTrustProof>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RegistrationChallengeResponse {
+    pub(crate) challenge_id: String,
+    pub(crate) challenge: String,
+    pub(crate) issued_at: DateTime<Utc>,
+    pub(crate) orchestrator_public_key: String,
+    pub(crate) signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DeviceRegistrationTrustProof {
+    pub(crate) orchestrator_challenge_id: String,
+    pub(crate) orchestrator_challenge: String,
+    pub(crate) orchestrator_challenge_issued_at: DateTime<Utc>,
+    pub(crate) orchestrator_signature: String,
+    pub(crate) edge_public_key: String,
+    pub(crate) edge_signature: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -334,6 +355,8 @@ pub(crate) struct DeviceMetadata {
     pub(crate) registered_at: Option<DateTime<Utc>>,
     pub(crate) last_seen_at: Option<DateTime<Utc>>,
     pub(crate) last_probe: Option<AvailabilitySnapshot>,
+    pub(crate) edge_public_key: Option<String>,
+    pub(crate) last_trusted_registration_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, FromRow)]

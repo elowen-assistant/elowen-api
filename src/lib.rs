@@ -17,6 +17,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures_util::StreamExt;
 use rand::RngCore;
 use reqwest::Client as HttpClient;
@@ -37,7 +38,7 @@ use formatting::{
     sanitize_string_list, slugify,
 };
 use models::*;
-use state::{AppState, AssistantRuntime, AuthRuntime};
+use state::{AppState, AssistantRuntime, AuthRuntime, TrustRuntime};
 
 fn init_tracing(service_name: &'static str) {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -100,6 +101,14 @@ pub async fn run() -> anyhow::Result<()> {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(14);
+    let orchestrator_signing_key = env::var("ELOWEN_ORCHESTRATOR_SIGNING_KEY")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let require_trusted_edge_registration = env::var("ELOWEN_REQUIRE_TRUSTED_EDGE_REGISTRATION")
+        .ok()
+        .map(|value| parse_bool(&value))
+        .unwrap_or(false);
 
     let pool = PgPoolOptions::new()
         .max_connections(5)
@@ -149,9 +158,15 @@ pub async fn run() -> anyhow::Result<()> {
             cookie_name: auth_cookie_name,
             session_ttl: Duration::from_secs(auth_session_days * 24 * 60 * 60),
         },
+        trust: TrustRuntime {
+            orchestrator_signing_key,
+            require_trusted_edge_registration,
+        },
     };
 
-    let public_api = Router::new().route("/devices/{device_id}", put(register_device));
+    let public_api = Router::new()
+        .route("/trust/registration-challenge", get(registration_challenge))
+        .route("/devices/{device_id}", put(register_device));
 
     let protected_api = Router::new()
         .route("/threads", get(list_threads).post(create_thread))
@@ -227,6 +242,27 @@ async fn get_auth_session(
         enabled: state.auth.enabled(),
         authenticated: operator_label.is_some() || !state.auth.enabled(),
         operator_label,
+    }))
+}
+
+async fn registration_challenge(
+    State(state): State<AppState>,
+) -> Result<Json<RegistrationChallengeResponse>, AppError> {
+    let signing_key = load_orchestrator_signing_key(&state)?;
+    let challenge_id = Ulid::new().to_string();
+    let mut challenge_bytes = [0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut challenge_bytes);
+    let challenge = URL_SAFE_NO_PAD.encode(challenge_bytes);
+    let issued_at = Utc::now();
+    let payload = orchestrator_challenge_payload(&challenge_id, &challenge, issued_at);
+    let signature = signing_key.sign(payload.as_bytes());
+
+    Ok(Json(RegistrationChallengeResponse {
+        challenge_id,
+        challenge,
+        issued_at,
+        orchestrator_public_key: URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes()),
+        signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
     }))
 }
 
@@ -1246,20 +1282,45 @@ async fn register_device(
 
     let existing = load_device_row_optional(&state.pool, &sanitized_device_id).await?;
     let now = Utc::now();
+    let trusted_registration = verify_registration_trust(
+        &state,
+        &sanitized_device_id,
+        name,
+        request.primary_flag,
+        now,
+        request.trust.as_ref(),
+    )?;
+    let existing_metadata = existing.as_ref().map(|row| row.metadata.0.clone());
 
     let metadata = DeviceMetadata {
         allowed_repos: sanitize_string_list(request.allowed_repos),
         allowed_repo_roots: sanitize_string_list(request.allowed_repo_roots),
         discovered_repos: sanitize_string_list(request.discovered_repos),
         capabilities: sanitize_string_list(request.capabilities),
-        registered_at: existing
+        registered_at: existing_metadata
             .as_ref()
-            .and_then(|row| row.metadata.0.registered_at)
+            .and_then(|metadata| metadata.registered_at)
             .or(Some(now)),
         last_seen_at: Some(now),
-        last_probe: existing
+        last_probe: existing_metadata
             .as_ref()
-            .and_then(|row| row.metadata.0.last_probe.clone()),
+            .and_then(|metadata| metadata.last_probe.clone()),
+        edge_public_key: trusted_registration
+            .as_ref()
+            .map(|registration| registration.edge_public_key.clone())
+            .or_else(|| {
+                existing_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.edge_public_key.clone())
+            }),
+        last_trusted_registration_at: trusted_registration
+            .as_ref()
+            .map(|registration| registration.registered_at)
+            .or_else(|| {
+                existing_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.last_trusted_registration_at)
+            }),
     };
 
     let device = upsert_device_row(
@@ -3181,6 +3242,159 @@ fn device_has_repo_scope(device: &DeviceRecord) -> bool {
         || !device.discovered_repos.is_empty()
 }
 
+struct TrustedRegistration {
+    edge_public_key: String,
+    registered_at: DateTime<Utc>,
+}
+
+fn verify_registration_trust(
+    state: &AppState,
+    device_id: &str,
+    name: &str,
+    primary_flag: bool,
+    now: DateTime<Utc>,
+    proof: Option<&DeviceRegistrationTrustProof>,
+) -> Result<Option<TrustedRegistration>, AppError> {
+    let Some(proof) = proof else {
+        if state.trust.require_trusted_edge_registration {
+            return Err(AppError::unauthorized(anyhow::anyhow!(
+                "trusted edge registration proof is required"
+            )));
+        }
+
+        return Ok(None);
+    };
+
+    let signing_key = load_orchestrator_signing_key(state)?;
+    let orchestrator_public_key = URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes());
+    let orchestrator_verifying_key =
+        decode_verifying_key(&orchestrator_public_key, "orchestrator public key")?;
+    let challenge_signature = decode_signature(
+        &proof.orchestrator_signature,
+        "orchestrator challenge signature",
+    )?;
+    let challenge_payload = orchestrator_challenge_payload(
+        &proof.orchestrator_challenge_id,
+        &proof.orchestrator_challenge,
+        proof.orchestrator_challenge_issued_at,
+    );
+
+    orchestrator_verifying_key
+        .verify(challenge_payload.as_bytes(), &challenge_signature)
+        .map_err(|_| {
+            AppError::unauthorized(anyhow::anyhow!(
+                "orchestrator registration challenge signature is invalid"
+            ))
+        })?;
+
+    let age = now.signed_duration_since(proof.orchestrator_challenge_issued_at);
+    if age.num_seconds() < -60 || age.num_seconds() > 10 * 60 {
+        return Err(AppError::unauthorized(anyhow::anyhow!(
+            "orchestrator registration challenge is outside the allowed time window"
+        )));
+    }
+
+    let edge_verifying_key = decode_verifying_key(&proof.edge_public_key, "edge public key")?;
+    let edge_signature = decode_signature(&proof.edge_signature, "edge registration signature")?;
+    let registration_payload = edge_registration_payload(device_id, name, primary_flag, proof);
+
+    edge_verifying_key
+        .verify(registration_payload.as_bytes(), &edge_signature)
+        .map_err(|_| {
+            AppError::unauthorized(anyhow::anyhow!("edge registration signature is invalid"))
+        })?;
+
+    Ok(Some(TrustedRegistration {
+        edge_public_key: proof.edge_public_key.clone(),
+        registered_at: now,
+    }))
+}
+
+fn load_orchestrator_signing_key(state: &AppState) -> Result<SigningKey, AppError> {
+    let key = state
+        .trust
+        .orchestrator_signing_key
+        .as_deref()
+        .ok_or_else(|| {
+            AppError::conflict(anyhow::anyhow!(
+                "orchestrator signing key is not configured"
+            ))
+        })?;
+
+    decode_signing_key(key, "orchestrator signing key")
+}
+
+fn decode_signing_key(value: &str, label: &str) -> Result<SigningKey, AppError> {
+    let bytes = decode_base64_bytes(value, label)?;
+    let key_bytes: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+        AppError::bad_request(anyhow::anyhow!(
+            "{label} must decode to a 32-byte Ed25519 private key"
+        ))
+    })?;
+
+    Ok(SigningKey::from_bytes(&key_bytes))
+}
+
+fn decode_verifying_key(value: &str, label: &str) -> Result<VerifyingKey, AppError> {
+    let bytes = decode_base64_bytes(value, label)?;
+    let key_bytes: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+        AppError::bad_request(anyhow::anyhow!(
+            "{label} must decode to a 32-byte Ed25519 public key"
+        ))
+    })?;
+
+    VerifyingKey::from_bytes(&key_bytes)
+        .map_err(|_| AppError::bad_request(anyhow::anyhow!("{label} is not a valid Ed25519 key")))
+}
+
+fn decode_signature(value: &str, label: &str) -> Result<Signature, AppError> {
+    let bytes = decode_base64_bytes(value, label)?;
+    Signature::from_slice(&bytes).map_err(|_| {
+        AppError::bad_request(anyhow::anyhow!(
+            "{label} must decode to a 64-byte Ed25519 signature"
+        ))
+    })
+}
+
+fn decode_base64_bytes(value: &str, label: &str) -> Result<Vec<u8>, AppError> {
+    URL_SAFE_NO_PAD
+        .decode(value.trim())
+        .map_err(|_| AppError::bad_request(anyhow::anyhow!("{label} is not valid base64url")))
+}
+
+fn orchestrator_challenge_payload(
+    challenge_id: &str,
+    challenge: &str,
+    issued_at: DateTime<Utc>,
+) -> String {
+    format!(
+        "elowen-orchestrator-registration-challenge\n{challenge_id}\n{challenge}\n{}",
+        issued_at.to_rfc3339()
+    )
+}
+
+fn edge_registration_payload(
+    device_id: &str,
+    name: &str,
+    primary_flag: bool,
+    proof: &DeviceRegistrationTrustProof,
+) -> String {
+    format!(
+        "elowen-edge-registration\n{device_id}\n{name}\n{primary_flag}\n{}\n{}\n{}\n{}",
+        proof.orchestrator_challenge_id,
+        proof.orchestrator_challenge,
+        proof.orchestrator_challenge_issued_at.to_rfc3339(),
+        proof.edge_public_key
+    )
+}
+
+fn parse_bool(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 async fn load_device_row(pool: &PgPool, device_id: &str) -> Result<DeviceRow, AppError> {
     load_device_row_optional(pool, device_id)
         .await?
@@ -3255,6 +3469,17 @@ fn device_record_from_row(row: DeviceRow) -> DeviceRecord {
     }
 }
 
+fn job_event_from_row(row: JobEventRow) -> JobEventRecord {
+    JobEventRecord {
+        id: row.id,
+        job_id: row.job_id,
+        correlation_id: row.correlation_id,
+        event_type: row.event_type,
+        payload_json: row.payload_json.0,
+        created_at: row.created_at,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{device_has_repo_scope, ensure_repo_allowed};
@@ -3295,16 +3520,5 @@ mod tests {
         assert!(device_has_repo_scope(&device));
         assert!(ensure_repo_allowed(&device, "elowen-api").is_ok());
         assert!(ensure_repo_allowed(&device, "other-repo").is_err());
-    }
-}
-
-fn job_event_from_row(row: JobEventRow) -> JobEventRecord {
-    JobEventRecord {
-        id: row.id,
-        job_id: row.job_id,
-        correlation_id: row.correlation_id,
-        event_type: row.event_type,
-        payload_json: row.payload_json.0,
-        created_at: row.created_at,
     }
 }

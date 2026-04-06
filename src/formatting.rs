@@ -388,10 +388,10 @@ fn compact_disposable_worktree_paths(value: &str) -> String {
 
 fn compact_file_reference(label: &str, path: &str) -> String {
     let normalized = path.replace('\\', "/");
-    if let Some(file_name) = normalized.rsplit('/').next() {
-        if let Some((_, anchor)) = file_name.split_once('#') {
-            return format!("{label}#{anchor}");
-        }
+    if let Some(file_name) = normalized.rsplit('/').next()
+        && let Some((_, anchor)) = file_name.split_once('#')
+    {
+        return format!("{label}#{anchor}");
     }
     label.to_string()
 }
