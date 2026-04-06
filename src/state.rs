@@ -1,9 +1,11 @@
 //! Shared runtime state for the orchestration API.
 
+use crate::models::UiEvent;
 use async_nats::Client as NatsClient;
 use reqwest::Client as HttpClient;
 use sqlx::PgPool;
 use std::time::Duration;
+use tokio::sync::broadcast;
 
 /// Runtime settings for orchestrator-side assistant replies.
 #[derive(Clone)]
@@ -45,4 +47,5 @@ pub(crate) struct AppState {
     pub(crate) assistant: AssistantRuntime,
     pub(crate) auth: AuthRuntime,
     pub(crate) trust: TrustRuntime,
+    pub(crate) ui_events: broadcast::Sender<UiEvent>,
 }

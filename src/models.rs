@@ -41,6 +41,16 @@ pub(crate) struct MessageRecord {
     pub(crate) updated_at: DateTime<Utc>,
 }
 
+/// Lightweight browser notification that tells the UI which REST resource changed.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct UiEvent {
+    pub(crate) event_type: String,
+    pub(crate) thread_id: Option<String>,
+    pub(crate) job_id: Option<String>,
+    pub(crate) device_id: Option<String>,
+    pub(crate) created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ExecutionIntent {

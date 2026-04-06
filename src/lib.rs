@@ -12,7 +12,10 @@ use axum::{
     extract::{Path, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
-    response::Response,
+    response::{
+        Response, Sse,
+        sse::{Event, KeepAlive},
+    },
     routing::{get, post, put},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -23,8 +26,8 @@ use rand::RngCore;
 use reqwest::Client as HttpClient;
 use serde_json::{Value, json};
 use sqlx::{PgPool, postgres::PgPoolOptions, types::Json as SqlxJson};
-use std::{collections::HashSet, env, net::SocketAddr, time::Duration};
-use tokio::time::timeout;
+use std::{collections::HashSet, convert::Infallible, env, net::SocketAddr, time::Duration};
+use tokio::{sync::broadcast, time::timeout};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 use ulid::Ulid;
@@ -128,10 +131,14 @@ pub async fn run() -> anyhow::Result<()> {
         .build()
         .context("failed to build HTTP client")?;
 
+    let (ui_events, _) = broadcast::channel(256);
     let event_pool = pool.clone();
     let event_nats = nats.clone();
+    let event_ui_events = ui_events.clone();
     tokio::spawn(async move {
-        if let Err(error) = consume_job_lifecycle_events(event_pool, event_nats).await {
+        if let Err(error) =
+            consume_job_lifecycle_events(event_pool, event_nats, event_ui_events).await
+        {
             warn!(error = %error, "job lifecycle consumer stopped");
         }
     });
@@ -162,6 +169,7 @@ pub async fn run() -> anyhow::Result<()> {
             orchestrator_signing_key,
             require_trusted_edge_registration,
         },
+        ui_events,
     };
 
     let public_api = Router::new()
@@ -193,6 +201,7 @@ pub async fn run() -> anyhow::Result<()> {
         .route("/approvals/{approval_id}/resolve", post(resolve_approval))
         .route("/devices", get(list_devices))
         .route("/devices/{device_id}", get(get_device))
+        .route("/events", get(stream_ui_events))
         .route(
             "/devices/{device_id}/availability-probe",
             post(probe_device),
@@ -349,6 +358,74 @@ async fn logout(
     ))
 }
 
+async fn stream_ui_events(
+    State(state): State<AppState>,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+    let mut receiver = state.ui_events.subscribe();
+
+    let stream = async_stream::stream! {
+        loop {
+            match receiver.recv().await {
+                Ok(event) => {
+                    let event_type = event.event_type.clone();
+                    match serde_json::to_string(&event) {
+                        Ok(payload) => {
+                            yield Ok(Event::default().event(event_type).data(payload));
+                        }
+                        Err(error) => {
+                            warn!(error = %error, "failed to serialize UI event");
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "UI event stream lagged");
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+fn publish_ui_event(state: &AppState, event: UiEvent) {
+    publish_ui_event_to(&state.ui_events, event);
+}
+
+fn publish_ui_event_to(sender: &broadcast::Sender<UiEvent>, event: UiEvent) {
+    let _ = sender.send(event);
+}
+
+fn thread_ui_event(thread_id: &str) -> UiEvent {
+    UiEvent {
+        event_type: "thread.changed".to_string(),
+        thread_id: Some(thread_id.to_string()),
+        job_id: None,
+        device_id: None,
+        created_at: Utc::now(),
+    }
+}
+
+fn job_ui_event(thread_id: &str, job_id: &str, device_id: Option<&str>) -> UiEvent {
+    UiEvent {
+        event_type: "job.changed".to_string(),
+        thread_id: Some(thread_id.to_string()),
+        job_id: Some(job_id.to_string()),
+        device_id: device_id.map(str::to_string),
+        created_at: Utc::now(),
+    }
+}
+
+fn device_ui_event(device_id: &str) -> UiEvent {
+    UiEvent {
+        event_type: "device.changed".to_string(),
+        thread_id: None,
+        job_id: None,
+        device_id: Some(device_id.to_string()),
+        created_at: Utc::now(),
+    }
+}
+
 async fn require_authenticated_session(
     State(state): State<AppState>,
     request: Request,
@@ -497,6 +574,8 @@ async fn create_thread(
     .fetch_one(&state.pool)
     .await?;
 
+    publish_ui_event(&state, thread_ui_event(&thread.id));
+
     Ok((
         StatusCode::CREATED,
         Json(ThreadDetail {
@@ -530,6 +609,7 @@ async fn create_message(
     let message = insert_thread_message(&state.pool, &thread_id, &request.role, content).await?;
 
     touch_thread(&state.pool, &thread_id).await?;
+    publish_ui_event(&state, thread_ui_event(&thread_id));
 
     Ok((StatusCode::CREATED, Json(message)))
 }
@@ -575,6 +655,7 @@ async fn create_thread_chat(
     .await?;
 
     touch_thread(&state.pool, &thread_id).await?;
+    publish_ui_event(&state, thread_ui_event(&thread_id));
 
     Ok((
         StatusCode::CREATED,
@@ -671,6 +752,10 @@ async fn dispatch_thread_message(
     .await?;
 
     touch_thread(&state.pool, &thread_id).await?;
+    publish_ui_event(
+        &state,
+        job_ui_event(&thread_id, &job.id, job.device_id.as_deref()),
+    );
 
     Ok((
         StatusCode::CREATED,
@@ -744,6 +829,10 @@ async fn create_chat_dispatch(
     .await?;
 
     touch_thread(&state.pool, &thread_id).await?;
+    publish_ui_event(
+        &state,
+        job_ui_event(&thread_id, &job.id, job.device_id.as_deref()),
+    );
 
     Ok((
         StatusCode::CREATED,
@@ -772,6 +861,10 @@ async fn create_job(
     ensure_thread_exists(&state.pool, &thread_id).await?;
     let job = create_job_record(&state, &thread_id, &request).await?;
     touch_thread(&state.pool, &thread_id).await?;
+    publish_ui_event(
+        &state,
+        job_ui_event(&thread_id, &job.id, job.device_id.as_deref()),
+    );
 
     let detail = load_job_detail(&state, &job.id).await?;
     Ok((StatusCode::CREATED, Json(detail)))
@@ -1233,6 +1326,14 @@ async fn resolve_approval(
         update_job_status_only(&state.pool, &approval.job_id, "completed").await?;
     }
     touch_thread_for_job(&state.pool, &approval.job_id).await?;
+    publish_ui_event(
+        &state,
+        job_ui_event(
+            &approval.thread_id,
+            &approval.job_id,
+            approval_job.device_id.as_deref(),
+        ),
+    );
 
     Ok(Json(approval))
 }
@@ -1338,7 +1439,10 @@ async fn register_device(
         StatusCode::CREATED
     };
 
-    Ok((status, Json(device_record_from_row(device))))
+    let device = device_record_from_row(device);
+    publish_ui_event(&state, device_ui_event(&device.id));
+
+    Ok((status, Json(device)))
 }
 
 async fn probe_device(
@@ -1424,7 +1528,11 @@ async fn probe_device_via_nats(
     Ok(response)
 }
 
-async fn consume_job_lifecycle_events(pool: PgPool, nats: NatsClient) -> anyhow::Result<()> {
+async fn consume_job_lifecycle_events(
+    pool: PgPool,
+    nats: NatsClient,
+    ui_events: broadcast::Sender<UiEvent>,
+) -> anyhow::Result<()> {
     let subject = "elowen.jobs.events".to_string();
     let mut subscription = nats
         .subscribe(subject.clone())
@@ -1442,7 +1550,7 @@ async fn consume_job_lifecycle_events(pool: PgPool, nats: NatsClient) -> anyhow:
             }
         };
 
-        if let Err(error) = persist_job_lifecycle_event(&pool, &event).await {
+        if let Err(error) = persist_job_lifecycle_event(&pool, &ui_events, &event).await {
             warn!(
                 job_id = %event.job_id,
                 correlation_id = %event.correlation_id,
@@ -1465,6 +1573,7 @@ async fn consume_job_lifecycle_events(pool: PgPool, nats: NatsClient) -> anyhow:
 
 async fn persist_job_lifecycle_event(
     pool: &PgPool,
+    ui_events: &broadcast::Sender<UiEvent>,
     event: &JobLifecycleEvent,
 ) -> Result<(), AppError> {
     let payload_value = event.payload_json.clone().unwrap_or_else(|| json!({}));
@@ -1572,6 +1681,11 @@ async fn persist_job_lifecycle_event(
 
     maybe_post_thread_assistant_reply(pool, event).await?;
     touch_thread_for_job(pool, &event.job_id).await?;
+    let thread_id = load_job_thread_id(pool, &event.job_id).await?;
+    publish_ui_event_to(
+        ui_events,
+        job_ui_event(&thread_id, &event.job_id, Some(&event.device_id)),
+    );
     Ok(())
 }
 
@@ -1691,6 +1805,14 @@ async fn load_job_record(pool: &PgPool, job_id: &str) -> Result<JobRecord, AppEr
 
 async fn load_job_correlation_id(pool: &PgPool, job_id: &str) -> Result<String, AppError> {
     sqlx::query_scalar::<_, String>("select correlation_id from jobs where id = $1")
+        .bind(job_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| AppError::not_found(anyhow::anyhow!("job not found")))
+}
+
+async fn load_job_thread_id(pool: &PgPool, job_id: &str) -> Result<String, AppError> {
+    sqlx::query_scalar::<_, String>("select thread_id from jobs where id = $1")
         .bind(job_id)
         .fetch_optional(pool)
         .await?
