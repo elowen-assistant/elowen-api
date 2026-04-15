@@ -1,45 +1,10 @@
-//! DTOs, database rows, and wire models used by the orchestration API.
-//!
-//! Some of these types intentionally mirror DTOs in `elowen-ui`, `elowen-edge`,
-//! and `elowen-notes`. Keep duplicated contracts in sync across repositories.
+//! HTTP, NATS, and UI-facing wire models for the orchestration API.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::{FromRow, types::Json as SqlxJson};
 
-#[derive(Debug, Serialize, FromRow)]
-pub(crate) struct ThreadSummary {
-    pub(crate) id: String,
-    pub(crate) title: String,
-    pub(crate) status: String,
-    pub(crate) current_summary_id: Option<String>,
-    pub(crate) created_at: DateTime<Utc>,
-    pub(crate) updated_at: DateTime<Utc>,
-    pub(crate) message_count: i64,
-}
-
-#[derive(Debug, Serialize, FromRow)]
-pub(crate) struct ThreadRecord {
-    pub(crate) id: String,
-    pub(crate) title: String,
-    pub(crate) status: String,
-    pub(crate) current_summary_id: Option<String>,
-    pub(crate) created_at: DateTime<Utc>,
-    pub(crate) updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize, FromRow)]
-pub(crate) struct MessageRecord {
-    pub(crate) id: String,
-    pub(crate) thread_id: String,
-    pub(crate) role: String,
-    pub(crate) content: String,
-    pub(crate) status: String,
-    pub(crate) payload_json: Value,
-    pub(crate) created_at: DateTime<Utc>,
-    pub(crate) updated_at: DateTime<Utc>,
-}
+use super::persistence::{ApprovalRecord, JobRecord, MessageRecord, SummaryRecord, ThreadRecord};
 
 /// Lightweight browser notification that tells the UI which REST resource changed.
 #[derive(Debug, Clone, Serialize)]
@@ -77,36 +42,6 @@ pub(crate) struct ExecutionDraft {
     pub(crate) source_message_id: String,
     pub(crate) source_role: String,
     pub(crate) rationale: String,
-}
-
-#[derive(Debug, Serialize, Clone, FromRow)]
-pub(crate) struct JobRecord {
-    pub(crate) id: String,
-    pub(crate) short_id: String,
-    pub(crate) correlation_id: String,
-    pub(crate) thread_id: String,
-    pub(crate) title: String,
-    pub(crate) status: String,
-    pub(crate) result: Option<String>,
-    pub(crate) failure_class: Option<String>,
-    pub(crate) repo_name: String,
-    pub(crate) device_id: Option<String>,
-    pub(crate) branch_name: Option<String>,
-    pub(crate) base_branch: Option<String>,
-    pub(crate) parent_job_id: Option<String>,
-    pub(crate) created_at: DateTime<Utc>,
-    pub(crate) updated_at: DateTime<Utc>,
-    pub(crate) completed_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, FromRow)]
-pub(crate) struct JobEventRow {
-    pub(crate) id: String,
-    pub(crate) job_id: String,
-    pub(crate) correlation_id: String,
-    pub(crate) event_type: String,
-    pub(crate) payload_json: SqlxJson<Value>,
-    pub(crate) created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize)]
@@ -152,37 +87,6 @@ pub(crate) struct NoteRecord {
     pub(crate) source_id: Option<String>,
     pub(crate) current_revision_id: String,
     pub(crate) updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize, FromRow)]
-pub(crate) struct SummaryRecord {
-    pub(crate) id: String,
-    pub(crate) scope: String,
-    pub(crate) source_id: String,
-    pub(crate) version: i32,
-    pub(crate) content: String,
-    pub(crate) created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize, FromRow)]
-pub(crate) struct ApprovalRecord {
-    pub(crate) id: String,
-    pub(crate) thread_id: String,
-    pub(crate) job_id: String,
-    pub(crate) action_type: String,
-    pub(crate) status: String,
-    pub(crate) summary: String,
-    pub(crate) resolved_by: Option<String>,
-    pub(crate) resolution_reason: Option<String>,
-    pub(crate) created_at: DateTime<Utc>,
-    pub(crate) resolved_at: Option<DateTime<Utc>>,
-    pub(crate) updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, FromRow)]
-pub(crate) struct JobStateRow {
-    pub(crate) current_summary_id: Option<String>,
-    pub(crate) execution_report_json: SqlxJson<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -367,16 +271,6 @@ pub(crate) struct DeviceMetadata {
     pub(crate) last_probe: Option<AvailabilitySnapshot>,
     pub(crate) edge_public_key: Option<String>,
     pub(crate) last_trusted_registration_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, FromRow)]
-pub(crate) struct DeviceRow {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) primary_flag: bool,
-    pub(crate) metadata: SqlxJson<DeviceMetadata>,
-    pub(crate) created_at: DateTime<Utc>,
-    pub(crate) updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize)]

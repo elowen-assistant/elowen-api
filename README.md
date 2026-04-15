@@ -1,25 +1,39 @@
 # elowen-api
 
-Rust orchestrator service responsible for Elowen's thread, job, device, approval, authentication, and realtime state APIs.
+## Purpose
+
+Rust orchestrator service for Elowen. It owns the HTTP API, Postgres-backed operational state, NATS coordination, authenticated UI event streaming, and orchestrator-side chat assistance.
 
 ## Current Responsibilities
 
-- expose thread, message, job, approval, device, note, and authentication HTTP APIs
-- provide orchestrator-side conversational replies for Workflow #2 when the OpenAI runtime is configured
-- generate and persist execution drafts that can be promoted into laptop-backed jobs
-- coordinate explicit handoff from conversational chat into real edge execution
+- expose thread, message, job, approval, device, note, and authentication endpoints
+- persist thread, job, approval, device, and session state in Postgres
+- publish authenticated server-sent events for thread, job, and device changes
 - dispatch jobs and approval commands over NATS
-- persist operational state in Postgres
-- consume edge lifecycle events and publish thread/job/device changes to the UI over authenticated server-sent events
+- consume edge lifecycle events and fold them back into thread and job state
+- generate orchestrator-side assistant replies and execution drafts when the OpenAI runtime is configured
 - integrate with `elowen-notes` for thread and job context
-- enforce web UI session authentication when configured
-- issue signed registration challenges and verify edge-signed registration proofs for trusted edge registration
+- issue signed registration challenges and verify trusted edge registration proofs
 
-## Runtime Notes
+## Repository Layout
 
-The VPS deployment runs `elowen-api` from a prebuilt GHCR image rather than compiling on the server. Local development still uses normal Cargo workflows.
+- `src/app/` - startup, router assembly, middleware, SSE wiring, and tracing
+- `src/routes/` - HTTP handlers grouped by API surface
+- `src/services/` - assistant replies, lifecycle handling, UI events, notes integration, and job dispatch helpers
+- `src/db/` - Postgres queries grouped by domain
+- `src/models/` - transport models and persistence row types
+- `src/trust/` - registration challenge and proof verification helpers
+- `migrations/` - Postgres schema migrations
 
-Important environment variables include:
+## Runtime And Config Entrypoints
+
+Run locally with:
+
+```bash
+cargo run
+```
+
+Important environment variables:
 
 - `DATABASE_URL`
 - `NATS_URL`
@@ -29,13 +43,17 @@ Important environment variables include:
 - `ELOWEN_ORCHESTRATOR_SIGNING_KEY`
 - `ELOWEN_REQUIRE_TRUSTED_EDGE_REGISTRATION`
 
-## Verification
-
-Useful local checks:
+## Local Verification
 
 ```bash
 cargo fmt --check
-cargo test --quiet
 cargo clippy --all-targets -- -D warnings
+cargo test --quiet
 cargo doc --no-deps
 ```
+
+## Related Docs
+
+- `migrations/`
+- `../elowen-platform/docs/vps-deployment.md`
+- `../elowen-platform/env/`
