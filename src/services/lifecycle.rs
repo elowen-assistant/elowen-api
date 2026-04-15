@@ -22,8 +22,9 @@ use crate::{
     error::AppError,
     formatting::{
         execution_report_changed_entries, execution_report_last_message, execution_report_status,
-        format_failure_reply, format_read_only_success_reply, format_success_reply,
-        format_success_without_push_reply, primary_result_excerpt, sanitize_chat_result_text,
+        format_failure_reply, format_failure_result_summary, format_read_only_success_reply,
+        format_success_reply, format_success_without_push_reply, primary_result_excerpt,
+        sanitize_chat_result_text,
     },
     models::{ExecutionIntent, JobLifecycleEvent, UiEvent},
     services::ui_events::{job_ui_event, publish_ui_event_to},
@@ -313,7 +314,10 @@ async fn build_thread_assistant_reply(
                     primary_result_excerpt(last_message)
                 )
             } else {
-                details.clone()
+                format!(
+                    "Job `{}` finished its main work and is waiting for push approval.",
+                    job.short_id
+                )
             };
 
             Some((
@@ -338,7 +342,9 @@ async fn build_thread_assistant_reply(
                 sanitized_last_message
                     .as_deref()
                     .map(primary_result_excerpt)
-                    .unwrap_or_else(|| details.clone()),
+                    .unwrap_or_else(|| {
+                        format!("Read-only job `{}` finished successfully.", job.short_id)
+                    }),
                 make_completion_payload(details),
             ))
         }
@@ -363,34 +369,45 @@ async fn build_thread_assistant_reply(
                 sanitized_last_message
                     .as_deref()
                     .map(primary_result_excerpt)
-                    .unwrap_or_else(|| details.clone()),
+                    .unwrap_or_else(|| {
+                        format!(
+                            "Job `{}` finished successfully. No push approval was required.",
+                            job.short_id
+                        )
+                    }),
                 make_completion_payload(details),
             ))
         }
-        "job.completed" if event.result.as_deref() != Some("success") => Some((
-            format!("job_event:{}:completed", event.job_id),
-            format_failure_reply(
+        "job.completed" if event.result.as_deref() != Some("success") => {
+            let details = format_failure_reply(
                 &job,
                 build_status,
                 test_status,
                 changed_entries,
                 detail,
                 summary.as_ref(),
-            ),
-            json!({}),
-        )),
-        "job.failed" => Some((
-            format!("job_event:{}:failed", event.job_id),
-            format_failure_reply(
+            );
+            Some((
+                format!("job_event:{}:completed", event.job_id),
+                format_failure_result_summary(detail, summary.as_ref()),
+                make_completion_payload(details),
+            ))
+        }
+        "job.failed" => {
+            let details = format_failure_reply(
                 &job,
                 build_status,
                 test_status,
                 changed_entries,
                 detail,
                 summary.as_ref(),
-            ),
-            json!({}),
-        )),
+            );
+            Some((
+                format!("job_event:{}:failed", event.job_id),
+                format_failure_result_summary(detail, summary.as_ref()),
+                make_completion_payload(details),
+            ))
+        }
         _ => None,
     };
 

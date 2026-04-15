@@ -197,6 +197,19 @@ pub(crate) fn format_failure_reply(
     lines.join("\n")
 }
 
+pub(crate) fn format_failure_result_summary(
+    detail: Option<&str>,
+    summary: Option<&SummaryRecord>,
+) -> String {
+    if let Some(summary) = summary.filter(|summary| !summary.content.trim().is_empty()) {
+        truncate_text(&sanitize_chat_result_text(&summary.content), 240)
+    } else if let Some(detail) = detail {
+        truncate_text(&sanitize_chat_result_text(detail), 240)
+    } else {
+        "The job failed before it produced a final summary.".to_string()
+    }
+}
+
 pub(crate) fn sanitize_string_list(values: Vec<String>) -> Vec<String> {
     let mut sanitized = Vec::new();
 
@@ -465,7 +478,12 @@ pub(crate) fn slugify(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_job_title_from_message, primary_result_excerpt, sanitize_chat_result_text};
+    use super::{
+        derive_job_title_from_message, format_failure_result_summary, primary_result_excerpt,
+        sanitize_chat_result_text,
+    };
+    use crate::models::SummaryRecord;
+    use chrono::Utc;
 
     #[test]
     fn title_synthesis_uses_concise_labels() {
@@ -492,6 +510,32 @@ mod tests {
                 "The Cargo package name is `elowen-api`, from [Cargo.toml](D:/Projects/elowen/.elowen/worktrees/elowen-api/01knactp/Cargo.toml#L2)."
             ),
             "The Cargo package name is `elowen-api`, from `Cargo.toml#L2`."
+        );
+    }
+
+    #[test]
+    fn failure_result_summary_prefers_summary_content() {
+        let summary = SummaryRecord {
+            id: "sum-1".to_string(),
+            scope: "job".to_string(),
+            source_id: "job-1".to_string(),
+            version: 1,
+            content: "Build failed because the new transcript formatter borrowed a moved value."
+                .to_string(),
+            created_at: Utc::now(),
+        };
+
+        assert_eq!(
+            format_failure_result_summary(Some("low-level error"), Some(&summary)),
+            "Build failed because the new transcript formatter borrowed a moved value."
+        );
+    }
+
+    #[test]
+    fn failure_result_summary_falls_back_to_detail() {
+        assert_eq!(
+            format_failure_result_summary(Some("cargo test failed in the formatter module"), None),
+            "cargo test failed in the formatter module"
         );
     }
 }

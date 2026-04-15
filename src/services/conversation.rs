@@ -360,15 +360,24 @@ fn build_fallback_conversational_reply(
                 )
             })
             .unwrap_or_default();
+        if let Some(draft) = execution_draft {
+            return format!(
+                "I'm still in conversational mode for thread `{}`. I prepared a draft for repo `{}` on base branch `{}` below so you can refine it before you dispatch anything.{}",
+                thread.title,
+                draft.repo_name.as_deref().unwrap_or("unspecified"),
+                draft.base_branch,
+                repo_hint
+            );
+        }
         return format!(
-            "I’m in conversational mode for thread `{}` right now, so I have not created a laptop job yet. I can help refine the request or you can use the explicit dispatch controls to hand this off when you’re ready.{}",
+            "I'm in conversational mode for thread `{}` right now, so I have not created a laptop job yet. I can help refine the request or you can use the explicit dispatch controls when you're ready.{}",
             thread.title, repo_hint
         );
     }
 
     if let Some(draft) = execution_draft {
         return format!(
-            "I’m still in conversational mode, and I prepared an execution draft for repo `{}` on branch `{}` from the latest request. You can keep refining it here before explicitly dispatching it.",
+            "I'm still in conversational mode, and I prepared an execution draft for repo `{}` on base branch `{}` from the latest request. You can keep refining it here before explicitly dispatching it.",
             draft.repo_name.as_deref().unwrap_or("unspecified"),
             draft.base_branch
         );
@@ -376,7 +385,7 @@ fn build_fallback_conversational_reply(
 
     if let Some(job) = latest_job {
         return format!(
-            "I’m here in conversational mode. The latest job in this thread is `{}` for repo `{}`, currently `{}`{}.\n\nI can help you reason about the next step, summarize what happened, or prepare an explicit handoff into laptop execution when you want it.",
+            "I'm here in conversational mode. The latest job in this thread is `{}` for repo `{}`, currently `{}`{}.\n\nI can help you reason about the next step, summarize what happened, or prepare an explicit handoff into laptop execution when you want it.",
             job.short_id,
             job.repo_name,
             job.status,
@@ -389,13 +398,13 @@ fn build_fallback_conversational_reply(
 
     if let Some(note) = related_notes.first() {
         return format!(
-            "I’m here in conversational mode. I can answer questions about this thread, help plan work, or prepare an explicit laptop dispatch when needed.\n\nThe closest related note I found is `{}`: {}",
+            "I'm here in conversational mode. I can answer questions about this thread, help plan work, or prepare an explicit laptop dispatch when needed.\n\nThe closest related note I found is `{}`: {}",
             note.title,
             summarize_text(&note.summary, 160)
         );
     }
 
-    "I’m here in conversational mode. Ask me questions, work through a plan with me, or use the explicit dispatch controls when you want me to create a real laptop job.".to_string()
+    "I'm here in conversational mode. Ask me questions, work through a plan with me, or use the explicit dispatch controls when you want me to create a real laptop job.".to_string()
 }
 
 pub(crate) fn looks_like_execution_request(value: &str) -> bool {
@@ -486,6 +495,14 @@ fn looks_like_draft_refinement(value: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DraftRefinement {
+    repo_name: Option<String>,
+    base_branch: Option<String>,
+    title: Option<String>,
+    request_update: Option<String>,
+}
+
 pub(crate) fn maybe_build_execution_draft(
     messages: &[MessageRecord],
     jobs: &[JobRecord],
@@ -496,20 +513,40 @@ pub(crate) fn maybe_build_execution_draft(
         .find(|message| message.role == "user")?;
     let latest_text = latest_user.content.trim();
     let previous_draft = messages.iter().rev().find_map(message_execution_draft);
-    let should_draft = looks_like_execution_request(latest_text)
+    let request_is_execution = looks_like_execution_request(latest_text);
+    let should_draft = request_is_execution
         || (previous_draft.is_some() && looks_like_draft_refinement(latest_text));
     if !should_draft {
         return None;
     }
 
-    let repo_name = extract_repo_hint(latest_text)
+    let refinement = if previous_draft.is_some() && !request_is_execution {
+        parse_draft_refinement(latest_text)
+    } else {
+        DraftRefinement::default()
+    };
+    let request_text = if request_is_execution {
+        latest_text.to_string()
+    } else if let Some(previous_draft) = previous_draft.as_ref() {
+        merge_request_text(
+            previous_draft.request_text.trim(),
+            refinement.request_update.as_deref(),
+        )
+    } else {
+        latest_text.to_string()
+    };
+    let repo_name = refinement
+        .repo_name
+        .or_else(|| extract_repo_hint(latest_text))
         .or_else(|| {
             previous_draft
                 .as_ref()
                 .and_then(|draft| draft.repo_name.clone())
         })
         .or_else(|| jobs.first().map(|job| job.repo_name.clone()));
-    let base_branch = extract_base_branch_hint(latest_text)
+    let base_branch = refinement
+        .base_branch
+        .or_else(|| extract_base_branch_hint(latest_text))
         .or_else(|| {
             previous_draft
                 .as_ref()
@@ -517,37 +554,36 @@ pub(crate) fn maybe_build_execution_draft(
         })
         .or_else(|| jobs.first().and_then(|job| job.base_branch.clone()))
         .unwrap_or_else(|| "main".to_string());
-    let execution_intent = if !looks_like_execution_request(latest_text) {
+    let execution_intent = if request_is_execution {
+        infer_execution_intent(latest_text)
+    } else if let Some(intent_override) = extract_execution_intent_override(latest_text) {
+        intent_override
+    } else {
         previous_draft
             .as_ref()
             .map(|draft| draft.execution_intent.clone())
             .unwrap_or_else(|| infer_execution_intent(latest_text))
-    } else {
-        infer_execution_intent(latest_text)
     };
-    let request_text = if let Some(previous_draft) = previous_draft.as_ref() {
-        if !looks_like_execution_request(latest_text) && looks_like_draft_refinement(latest_text) {
-            format!(
-                "{}\n\nRefinement: {}",
-                previous_draft.request_text.trim(),
-                latest_text
-            )
-        } else {
-            latest_text.to_string()
-        }
+    let title = if let Some(title) = refinement.title {
+        title
+    } else if request_is_execution {
+        derive_job_title_from_message(&request_text)
+    } else if let Some(request_update) = refinement.request_update.as_deref() {
+        derive_job_title_from_message(request_update)
     } else {
-        latest_text.to_string()
-    };
-    let title = if !looks_like_execution_request(latest_text) {
+        let request_changed = previous_draft
+            .as_ref()
+            .map(|draft| draft.request_text.trim() != request_text.trim())
+            .unwrap_or(true);
         previous_draft
             .as_ref()
+            .filter(|_| !request_changed)
             .map(|draft| draft.title.clone())
             .unwrap_or_else(|| derive_job_title_from_message(&request_text))
-    } else {
-        derive_job_title_from_message(&request_text)
     };
     let rationale = if previous_draft.is_some() && looks_like_draft_refinement(latest_text) {
-        "Updated the draft using the latest conversational refinement.".to_string()
+        "Updated the draft using the latest conversational refinement without dispatching a job."
+            .to_string()
     } else if matches!(execution_intent, ExecutionIntent::ReadOnly) {
         "Prepared as a read-only repository investigation so the laptop can inspect and report without creating durable repo changes.".to_string()
     } else {
@@ -580,6 +616,15 @@ fn extract_base_branch_hint(value: &str) -> Option<String> {
         .or_else(|| extract_keyword_value(value, "branch"))
 }
 
+fn extract_title_hint(value: &str) -> Option<String> {
+    extract_backticked_hint(value, "title")
+        .or_else(|| extract_phrase_value(value, "title"))
+        .or_else(|| extract_phrase_value(value, "call it"))
+        .or_else(|| extract_phrase_value(value, "rename it to"))
+        .or_else(|| extract_phrase_value(value, "rename this to"))
+        .or_else(|| extract_phrase_value(value, "rename to"))
+}
+
 fn extract_backticked_hint(value: &str, prefix: &str) -> Option<String> {
     let lower = value.to_ascii_lowercase();
     let pattern = format!("{prefix} `");
@@ -605,29 +650,185 @@ fn extract_keyword_value(value: &str, prefix: &str) -> Option<String> {
     sanitize_optional_string(Some(token.to_string()))
 }
 
+fn extract_phrase_value(value: &str, prefix: &str) -> Option<String> {
+    let lower = value.to_ascii_lowercase();
+    let start = lower.find(prefix)?;
+    let original = value[start + prefix.len()..].trim_start_matches([' ', ':', '-', '=']);
+    if let Some(stripped) = original.strip_prefix('`') {
+        let end = stripped.find('`')?;
+        return sanitize_optional_string(Some(stripped[..end].trim().to_string()));
+    }
+
+    let cutoff = [
+        "\n",
+        ".",
+        ";",
+        ", and ",
+        " and use ",
+        " and switch ",
+        " and set ",
+        " and keep ",
+    ]
+    .iter()
+    .filter_map(|marker| original.find(marker))
+    .min()
+    .unwrap_or(original.len());
+    sanitize_optional_string(Some(
+        original[..cutoff].trim_matches('`').trim().to_string(),
+    ))
+}
+
+fn extract_execution_intent_override(value: &str) -> Option<ExecutionIntent> {
+    let lower = value.to_ascii_lowercase();
+    if [
+        "read-only",
+        "read only",
+        "do not modify",
+        "don't modify",
+        "do not change",
+        "don't change",
+        "no changes",
+        "without changing",
+        "without modifying",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        Some(ExecutionIntent::ReadOnly)
+    } else if [
+        "allow changes",
+        "make changes",
+        "modify the repo",
+        "workspace change",
+        "go ahead and change",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        Some(ExecutionIntent::WorkspaceChange)
+    } else {
+        None
+    }
+}
+
+fn parse_draft_refinement(value: &str) -> DraftRefinement {
+    DraftRefinement {
+        repo_name: extract_repo_hint(value),
+        base_branch: extract_base_branch_hint(value),
+        title: extract_title_hint(value),
+        request_update: extract_refinement_request_update(value),
+    }
+}
+
+fn merge_request_text(previous_request: &str, request_update: Option<&str>) -> String {
+    let Some(update) = request_update
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return previous_request.to_string();
+    };
+
+    if previous_request.trim() == update {
+        previous_request.to_string()
+    } else {
+        format!("{previous_request}\n\nAdditional instruction: {update}")
+    }
+}
+
+fn extract_refinement_request_update(value: &str) -> Option<String> {
+    let mut request_fragments = Vec::new();
+
+    for raw_clause in value.split(['\n', ';', '.']) {
+        let clause = raw_clause.trim();
+        if clause.is_empty() {
+            continue;
+        }
+
+        if let Some(fragment) = strip_metadata_prefix(clause) {
+            if !fragment.is_empty() && !is_metadata_only_clause(&fragment) {
+                request_fragments.push(fragment);
+            }
+            continue;
+        }
+
+        if is_metadata_only_clause(clause) {
+            continue;
+        }
+
+        request_fragments.push(clause.to_string());
+    }
+
+    sanitize_optional_string(Some(request_fragments.join(" ")))
+}
+
+fn strip_metadata_prefix(clause: &str) -> Option<String> {
+    let lower = clause.to_ascii_lowercase();
+    let prefixes = [
+        "repo ",
+        "repository ",
+        "use repo ",
+        "use repository ",
+        "base branch ",
+        "branch ",
+        "use branch ",
+        "use base branch ",
+        "title ",
+        "call it ",
+        "rename it to ",
+        "rename this to ",
+        "rename to ",
+    ];
+
+    if prefixes.iter().any(|prefix| lower.starts_with(prefix)) {
+        for marker in [" and ", ", then ", ", "] {
+            if let Some(index) = lower.find(marker) {
+                let remainder = clause[index + marker.len()..].trim();
+                return Some(remainder.to_string());
+            }
+        }
+        return Some(String::new());
+    }
+
+    None
+}
+
+fn is_metadata_only_clause(clause: &str) -> bool {
+    let lower = clause.to_ascii_lowercase();
+    if [
+        "send it",
+        "dispatch it",
+        "run it",
+        "keep it read-only",
+        "make it read-only",
+        "leave it read-only",
+    ]
+    .iter()
+    .any(|needle| lower == *needle)
+    {
+        return true;
+    }
+
+    extract_title_hint(clause).is_some()
+        || extract_repo_hint(clause).is_some()
+        || extract_base_branch_hint(clause).is_some()
+        || extract_execution_intent_override(clause).is_some()
+}
+
 pub(crate) fn maybe_annotate_draft_reply(
     reply: String,
     execution_draft: Option<&ExecutionDraft>,
 ) -> String {
-    let Some(execution_draft) = execution_draft else {
+    let Some(_) = execution_draft else {
         return reply;
     };
 
     let trimmed = reply.trim();
     if trimmed.is_empty() {
-        return format!(
-            "I prepared an execution draft for repo `{}` on branch `{}`. Review it below before dispatching it.",
-            execution_draft
-                .repo_name
-                .as_deref()
-                .unwrap_or("unspecified"),
-            execution_draft.base_branch
-        );
+        return "I prepared an execution draft below so you can keep refining it before dispatch."
+            .to_string();
     }
 
-    format!(
-        "{trimmed}\n\nI also drafted an execution handoff below so you can review and refine it before dispatching it."
-    )
+    trimmed.to_string()
 }
 
 pub(crate) fn summarize_text(value: &str, limit: usize) -> String {
@@ -636,5 +837,186 @@ pub(crate) fn summarize_text(value: &str, limit: usize) -> String {
         trimmed.to_string()
     } else {
         trimmed.chars().take(limit).collect::<String>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DraftRefinement, extract_refinement_request_update, extract_title_hint,
+        maybe_annotate_draft_reply, maybe_build_execution_draft, parse_draft_refinement,
+    };
+    use crate::models::{ExecutionDraft, ExecutionIntent, JobRecord, MessageRecord};
+    use chrono::Utc;
+    use serde_json::json;
+
+    fn user_message(id: &str, content: &str) -> MessageRecord {
+        MessageRecord {
+            id: id.to_string(),
+            thread_id: "thread-1".to_string(),
+            role: "user".to_string(),
+            content: content.to_string(),
+            status: "conversation.user".to_string(),
+            payload_json: json!({}),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn assistant_draft_message(id: &str, draft: &ExecutionDraft) -> MessageRecord {
+        MessageRecord {
+            id: id.to_string(),
+            thread_id: "thread-1".to_string(),
+            role: "assistant".to_string(),
+            content: "draft".to_string(),
+            status: "conversation.reply".to_string(),
+            payload_json: json!({
+                "execution_draft": draft
+            }),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn previous_draft() -> ExecutionDraft {
+        ExecutionDraft {
+            title: "Polish chat shell".to_string(),
+            repo_name: Some("elowen-ui".to_string()),
+            base_branch: "main".to_string(),
+            request_text: "Tighten the chat shell spacing and improve result presentation."
+                .to_string(),
+            execution_intent: ExecutionIntent::WorkspaceChange,
+            source_message_id: "u1".to_string(),
+            source_role: "user".to_string(),
+            rationale:
+                "Prepared from the latest user request so it can be reviewed before dispatch."
+                    .to_string(),
+        }
+    }
+
+    fn sample_job() -> JobRecord {
+        JobRecord {
+            id: "job-1".to_string(),
+            short_id: "job-1".to_string(),
+            correlation_id: "corr-1".to_string(),
+            thread_id: "thread-1".to_string(),
+            title: "Existing".to_string(),
+            status: "completed".to_string(),
+            result: Some("success".to_string()),
+            failure_class: None,
+            repo_name: "elowen-api".to_string(),
+            device_id: Some("edge-1".to_string()),
+            branch_name: Some("codex/job-1-existing".to_string()),
+            base_branch: Some("main".to_string()),
+            parent_job_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            completed_at: None,
+        }
+    }
+
+    #[test]
+    fn parses_explicit_refinement_overrides_and_request_update() {
+        assert_eq!(
+            parse_draft_refinement(
+                "Use repo `elowen-api`, branch `release/2026`, call it `API transcript polish`, and add failure detail disclosure."
+            ),
+            DraftRefinement {
+                repo_name: Some("elowen-api".to_string()),
+                base_branch: Some("release/2026".to_string()),
+                title: Some("API transcript polish".to_string()),
+                request_update: Some("add failure detail disclosure".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn metadata_only_refinement_does_not_pollute_request_text() {
+        let draft = previous_draft();
+        let messages = vec![
+            user_message(
+                "u1",
+                "Tighten the chat shell spacing and improve result presentation.",
+            ),
+            assistant_draft_message("a1", &draft),
+            user_message(
+                "u2",
+                "Use repo `elowen-api`, base branch `release/2026`, and call it `API transcript polish`.",
+            ),
+        ];
+
+        let next_draft = maybe_build_execution_draft(&messages, &[sample_job()]).unwrap();
+
+        assert_eq!(next_draft.repo_name.as_deref(), Some("elowen-api"));
+        assert_eq!(next_draft.base_branch, "release/2026");
+        assert_eq!(next_draft.title, "API transcript polish");
+        assert_eq!(
+            next_draft.request_text,
+            "Tighten the chat shell spacing and improve result presentation."
+        );
+    }
+
+    #[test]
+    fn substantive_refinement_appends_only_residual_instruction() {
+        let draft = previous_draft();
+        let messages = vec![
+            user_message(
+                "u1",
+                "Tighten the chat shell spacing and improve result presentation.",
+            ),
+            assistant_draft_message("a1", &draft),
+            user_message(
+                "u2",
+                "Use repo `elowen-ui` and add local timestamp formatting in the thread transcript.",
+            ),
+        ];
+
+        let next_draft = maybe_build_execution_draft(&messages, &[sample_job()]).unwrap();
+
+        assert_eq!(
+            next_draft.request_text,
+            "Tighten the chat shell spacing and improve result presentation.\n\nAdditional instruction: add local timestamp formatting in the thread transcript"
+        );
+        assert_eq!(
+            next_draft.title,
+            "Add local timestamp formatting in the thread"
+        );
+    }
+
+    #[test]
+    fn empty_draft_reply_uses_single_line_prompt() {
+        assert_eq!(
+            maybe_annotate_draft_reply("".to_string(), Some(&previous_draft())),
+            "I prepared an execution draft below so you can keep refining it before dispatch."
+        );
+    }
+
+    #[test]
+    fn non_empty_draft_reply_is_not_padded_with_duplicate_handoff_copy() {
+        assert_eq!(
+            maybe_annotate_draft_reply(
+                "Let's tighten the transcript surfaces first.".to_string(),
+                Some(&previous_draft()),
+            ),
+            "Let's tighten the transcript surfaces first."
+        );
+    }
+
+    #[test]
+    fn extracts_title_hint_from_rename_phrase() {
+        assert_eq!(
+            extract_title_hint("Rename it to `Transcript polish` and keep it read-only."),
+            Some("Transcript polish".to_string())
+        );
+    }
+
+    #[test]
+    fn refinement_request_update_ignores_metadata_only_clauses() {
+        assert_eq!(
+            extract_refinement_request_update(
+                "Use repo `elowen-ui`. Base branch `release/2026`. Keep it read-only."
+            ),
+            None
+        );
     }
 }
