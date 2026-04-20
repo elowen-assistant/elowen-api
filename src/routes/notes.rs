@@ -1,7 +1,7 @@
 //! Thread/job note routes.
 
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, State},
     http::StatusCode,
 };
@@ -15,6 +15,7 @@ use crate::{
     models::{
         NoteAuthor, NoteRecord, NoteSourceReference, PromoteJobNoteRequest, PromoteNoteRequest,
     },
+    routes::require_session_actor,
     services::{
         conversation::summarize_text,
         notes::{
@@ -51,9 +52,11 @@ pub(crate) async fn get_job_notes(
 
 pub(crate) async fn promote_job_note(
     State(state): State<AppState>,
+    actor: Option<Extension<crate::auth::SessionActor>>,
     Path(job_id): Path<String>,
     Json(request): Json<PromoteJobNoteRequest>,
 ) -> Result<(StatusCode, Json<NoteRecord>), AppError> {
+    let actor = require_session_actor(actor);
     let job = load_job_record(&state.pool, &job_id).await?;
     let summary = load_current_job_summary(&state.pool, &job_id).await?;
     let existing_note_id = search_notes(&state, None, Some("job"), Some(job.id.as_str()), 1)
@@ -109,9 +112,9 @@ pub(crate) async fn promote_job_note(
                 "branch_name": job.branch_name,
             })),
             authored_by: Some(NoteAuthor {
-                actor_type: "system".to_string(),
-                actor_id: "elowen-api".to_string(),
-                display_name: Some("Elowen API".to_string()),
+                actor_type: "operator".to_string(),
+                actor_id: actor.username,
+                display_name: Some(actor.display_name),
             }),
             source_references,
         },

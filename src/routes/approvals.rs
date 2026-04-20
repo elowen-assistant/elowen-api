@@ -1,7 +1,7 @@
 //! Approval resolution routes.
 
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, State},
 };
 use serde_json::json;
@@ -16,6 +16,7 @@ use crate::{
     },
     error::AppError,
     models::{ApprovalRecord, ResolveApprovalRequest},
+    routes::require_session_actor,
     services::{
         jobs::publish_push_approval_command,
         ui_events::{job_ui_event, publish_ui_event},
@@ -25,9 +26,11 @@ use crate::{
 
 pub(crate) async fn resolve_approval(
     State(state): State<AppState>,
+    actor: Option<Extension<crate::auth::SessionActor>>,
     Path(approval_id): Path<String>,
     Json(request): Json<ResolveApprovalRequest>,
 ) -> Result<Json<ApprovalRecord>, AppError> {
+    let actor = require_session_actor(actor);
     let status = match request.status.trim().to_ascii_lowercase().as_str() {
         "approved" => "approved",
         "rejected" => "rejected",
@@ -37,7 +40,6 @@ pub(crate) async fn resolve_approval(
             )));
         }
     };
-    let resolved_by = crate::formatting::sanitize_optional_string(request.resolved_by);
     let reason = crate::formatting::sanitize_optional_string(request.reason);
     let existing_approval = load_approval_record(&state.pool, &approval_id).await?;
     if existing_approval.status != "pending" {
@@ -51,7 +53,8 @@ pub(crate) async fn resolve_approval(
         &state.pool,
         &approval_id,
         status,
-        resolved_by.clone(),
+        Some(actor.username.clone()),
+        Some(actor.display_name.clone()),
         reason.clone(),
     )
     .await?;
@@ -102,6 +105,7 @@ pub(crate) async fn resolve_approval(
             "approval_id": approval.id,
             "action_type": approval.action_type,
             "resolved_by": approval.resolved_by,
+            "resolved_by_display_name": approval.resolved_by_display_name,
             "reason": approval.resolution_reason,
         }),
     )

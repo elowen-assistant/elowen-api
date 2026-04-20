@@ -49,6 +49,13 @@ impl AppError {
         }
     }
 
+    pub(crate) fn forbidden(message: impl Into<anyhow::Error>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            error: message.into(),
+        }
+    }
+
     pub(crate) fn gateway_timeout(message: impl Into<anyhow::Error>) -> Self {
         Self {
             status: StatusCode::GATEWAY_TIMEOUT,

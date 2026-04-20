@@ -14,12 +14,14 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 
 use crate::{
+    auth::AuthProvider,
     routes::{
         create_chat_dispatch, create_job, create_message, create_thread, create_thread_chat,
         dispatch_thread_message, get_auth_session, get_device, get_job, get_job_notes, get_thread,
         get_thread_notes, list_devices, list_jobs, list_thread_jobs, list_threads, login, logout,
         probe_device, promote_job_note, register_device, registration_challenge,
-        require_authenticated_session, resolve_approval, stream_ui_events,
+        require_admin_session, require_operator_session, require_viewer_session, resolve_approval,
+        stream_ui_events,
     },
     services::lifecycle::consume_job_lifecycle_events,
     state::{AppState, AssistantRuntime, AuthRuntime, TrustRuntime},
@@ -71,6 +73,10 @@ pub async fn run() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "https://api.openai.com/v1".to_string())
         .trim_end_matches('/')
         .to_string();
+    let auth_config_path = env::var("ELOWEN_UI_AUTH_CONFIG_PATH")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let auth_password = env::var("ELOWEN_UI_PASSWORD")
         .ok()
         .map(|value| value.trim().to_string())
@@ -83,6 +89,10 @@ pub async fn run() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "elowen_session".to_string())
         .trim()
         .to_string();
+    let auth_cookie_secure = env::var("ELOWEN_UI_COOKIE_SECURE")
+        .ok()
+        .map(|value| parse_bool(&value))
+        .unwrap_or(false);
     let auth_session_days = env::var("ELOWEN_UI_SESSION_DAYS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -131,6 +141,9 @@ pub async fn run() -> anyhow::Result<()> {
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(8080);
     let address = SocketAddr::from(([0, 0, 0, 0], port));
+    let auth_provider =
+        AuthProvider::from_config(auth_config_path, auth_password, auth_operator_label)
+            .context("failed to configure UI authentication provider")?;
 
     let state = AppState {
         pool,
@@ -143,9 +156,9 @@ pub async fn run() -> anyhow::Result<()> {
             base_url: assistant_base_url,
         },
         auth: AuthRuntime {
-            password: auth_password,
-            operator_label: auth_operator_label,
+            provider: auth_provider,
             cookie_name: auth_cookie_name,
+            cookie_secure: auth_cookie_secure,
             session_ttl: Duration::from_secs(auth_session_days * 24 * 60 * 60),
         },
         trust: TrustRuntime {
@@ -159,9 +172,22 @@ pub async fn run() -> anyhow::Result<()> {
         .route("/trust/registration-challenge", get(registration_challenge))
         .route("/devices/{device_id}", put(register_device));
 
-    let protected_api = Router::new()
-        .route("/threads", get(list_threads).post(create_thread))
+    let viewer_api = Router::new()
+        .route("/threads", get(list_threads))
         .route("/threads/{thread_id}", get(get_thread))
+        .route("/threads/{thread_id}/notes", get(get_thread_notes))
+        .route("/threads/{thread_id}/jobs", get(list_thread_jobs))
+        .route("/jobs", get(list_jobs))
+        .route("/jobs/{job_id}", get(get_job))
+        .route("/jobs/{job_id}/notes", get(get_job_notes))
+        .route("/events", get(stream_ui_events))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_viewer_session,
+        ))
+        .with_state(state.clone());
+    let operator_api = Router::new()
+        .route("/threads", post(create_thread))
         .route("/threads/{thread_id}/messages", post(create_message))
         .route("/threads/{thread_id}/chat", post(create_thread_chat))
         .route(
@@ -172,26 +198,24 @@ pub async fn run() -> anyhow::Result<()> {
             "/threads/{thread_id}/chat-dispatch",
             post(create_chat_dispatch),
         )
-        .route("/threads/{thread_id}/notes", get(get_thread_notes))
-        .route(
-            "/threads/{thread_id}/jobs",
-            get(list_thread_jobs).post(create_job),
-        )
-        .route("/jobs", get(list_jobs))
-        .route("/jobs/{job_id}", get(get_job))
-        .route("/jobs/{job_id}/notes", get(get_job_notes))
+        .route("/threads/{thread_id}/jobs", post(create_job))
         .route("/jobs/{job_id}/notes/promote", post(promote_job_note))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_operator_session,
+        ))
+        .with_state(state.clone());
+    let admin_api = Router::new()
         .route("/approvals/{approval_id}/resolve", post(resolve_approval))
         .route("/devices", get(list_devices))
         .route("/devices/{device_id}", get(get_device))
-        .route("/events", get(stream_ui_events))
         .route(
             "/devices/{device_id}/availability-probe",
             post(probe_device),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
-            require_authenticated_session,
+            require_admin_session,
         ))
         .with_state(state.clone());
 
@@ -201,7 +225,9 @@ pub async fn run() -> anyhow::Result<()> {
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/logout", post(logout))
         .nest("/api/v1", public_api)
-        .nest("/api/v1", protected_api)
+        .nest("/api/v1", viewer_api)
+        .nest("/api/v1", operator_api)
+        .nest("/api/v1", admin_api)
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)

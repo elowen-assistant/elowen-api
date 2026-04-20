@@ -1,6 +1,7 @@
 //! Elowen orchestration API.
 
 mod app;
+mod auth;
 mod db;
 mod error;
 mod formatting;

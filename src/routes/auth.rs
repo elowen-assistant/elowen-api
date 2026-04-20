@@ -1,7 +1,8 @@
 //! Authentication, trusted registration, and realtime event routes.
 
+use anyhow::anyhow;
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::Next,
@@ -11,11 +12,11 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use ed25519_dalek::Signer;
 use rand::RngCore;
-use sqlx::PgPool;
 use std::time::Duration;
 use ulid::Ulid;
 
 use crate::{
+    auth::{AuthRole, SessionActor},
     error::AppError,
     models::{AuthSessionStatus, LoginRequest, RegistrationChallengeResponse},
     services::ui_events::stream_from_broadcast,
@@ -23,20 +24,22 @@ use crate::{
     trust::{load_orchestrator_signing_key, orchestrator_challenge_payload},
 };
 
+const DISABLED_AUTH_USERNAME: &str = "local-operator";
+const DISABLED_AUTH_DISPLAY_NAME: &str = "Local Operator";
+
 pub(crate) async fn get_auth_session(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<AuthSessionStatus>, AppError> {
-    purge_expired_sessions(&state.pool).await?;
+    purge_expired_sessions(&state).await?;
 
-    let operator_label =
-        current_session_operator_label(&state.pool, &state.auth.cookie_name, &headers).await?;
+    let actor = if state.auth.enabled() {
+        current_session_actor(&state, &headers).await?
+    } else {
+        None
+    };
 
-    Ok(Json(AuthSessionStatus {
-        enabled: state.auth.enabled(),
-        authenticated: operator_label.is_some() || !state.auth.enabled(),
-        operator_label,
-    }))
+    Ok(Json(build_auth_session_status(&state, actor)))
 }
 
 pub(crate) async fn registration_challenge(
@@ -64,30 +67,39 @@ pub(crate) async fn login(
     State(state): State<AppState>,
     Json(request): Json<LoginRequest>,
 ) -> Result<(StatusCode, HeaderMap, Json<AuthSessionStatus>), AppError> {
-    let expected_password =
-        state.auth.password.as_ref().ok_or_else(|| {
-            AppError::conflict(anyhow::anyhow!("web UI authentication is disabled"))
-        })?;
+    let actor = state
+        .auth
+        .provider
+        .authenticate(request.username.as_deref(), &request.password)?;
 
-    if request.password != *expected_password {
-        return Err(AppError::unauthorized(anyhow::anyhow!("invalid password")));
-    }
-
-    purge_expired_sessions(&state.pool).await?;
+    purge_expired_sessions(&state).await?;
 
     let token = new_session_token();
-    let expires_at = Utc::now()
+    let now = Utc::now();
+    let expires_at = now
         + chrono::Duration::from_std(state.auth.session_ttl)
-            .map_err(|error| AppError::from(anyhow::anyhow!(error)))?;
+            .map_err(|error| AppError::from(anyhow!(error)))?;
 
     sqlx::query(
         r#"
-        insert into ui_sessions (token, operator_label, expires_at)
-        values ($1, $2, $3)
+        insert into ui_sessions (
+            token,
+            operator_label,
+            account_username,
+            display_name,
+            role,
+            last_seen_at,
+            expires_at
+        )
+        values ($1, $2, $3, $4, $5, $6, $7)
         "#,
     )
     .bind(&token)
-    .bind(&state.auth.operator_label)
+    .bind(&actor.display_name)
+    .bind(&actor.username)
+    .bind(&actor.display_name)
+    .bind(actor_role_value(&actor.role))
+    .bind(now)
     .bind(expires_at)
     .execute(&state.pool)
     .await?;
@@ -99,6 +111,7 @@ pub(crate) async fn login(
             &state.auth.cookie_name,
             Some(&token),
             Some(state.auth.session_ttl),
+            state.auth.cookie_secure,
         ))
         .map_err(AppError::from)?,
     );
@@ -106,11 +119,7 @@ pub(crate) async fn login(
     Ok((
         StatusCode::OK,
         headers,
-        Json(AuthSessionStatus {
-            enabled: true,
-            authenticated: true,
-            operator_label: Some(state.auth.operator_label.clone()),
-        }),
+        Json(build_auth_session_status(&state, Some(actor))),
     ))
 }
 
@@ -128,18 +137,19 @@ pub(crate) async fn logout(
     let mut response_headers = HeaderMap::new();
     response_headers.insert(
         header::SET_COOKIE,
-        HeaderValue::from_str(&session_cookie_value(&state.auth.cookie_name, None, None))
-            .map_err(AppError::from)?,
+        HeaderValue::from_str(&session_cookie_value(
+            &state.auth.cookie_name,
+            None,
+            None,
+            state.auth.cookie_secure,
+        ))
+        .map_err(AppError::from)?,
     );
 
     Ok((
         StatusCode::OK,
         response_headers,
-        Json(AuthSessionStatus {
-            enabled: state.auth.enabled(),
-            authenticated: false,
-            operator_label: None,
-        }),
+        Json(build_auth_session_status(&state, None)),
     ))
 }
 
@@ -151,58 +161,161 @@ pub(crate) async fn stream_ui_events(
     stream_from_broadcast(state.ui_events.subscribe())
 }
 
-pub(crate) async fn require_authenticated_session(
+pub(crate) async fn require_viewer_session(
     State(state): State<AppState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, AppError> {
-    if !state.auth.enabled() {
-        return Ok(next.run(request).await);
-    }
-
-    purge_expired_sessions(&state.pool).await?;
-
-    let authenticated =
-        current_session_operator_label(&state.pool, &state.auth.cookie_name, request.headers())
-            .await?
-            .is_some();
-
-    if !authenticated {
-        return Err(AppError::unauthorized(anyhow::anyhow!("sign in required")));
-    }
-
+    authorize_request(&state, &mut request, AuthRole::Viewer).await?;
     Ok(next.run(request).await)
 }
 
-async fn current_session_operator_label(
-    pool: &PgPool,
-    cookie_name: &str,
+pub(crate) async fn require_operator_session(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    authorize_request(&state, &mut request, AuthRole::Operator).await?;
+    Ok(next.run(request).await)
+}
+
+pub(crate) async fn require_admin_session(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    authorize_request(&state, &mut request, AuthRole::Admin).await?;
+    Ok(next.run(request).await)
+}
+
+pub(crate) fn require_session_actor(actor: Option<Extension<SessionActor>>) -> SessionActor {
+    actor.map(|actor| actor.0).unwrap_or_else(disabled_actor)
+}
+
+fn build_auth_session_status(state: &AppState, actor: Option<SessionActor>) -> AuthSessionStatus {
+    let enabled = state.auth.enabled();
+    let permissions = if enabled {
+        actor
+            .as_ref()
+            .map(SessionActor::permissions)
+            .unwrap_or_default()
+    } else {
+        AuthRole::Admin.permissions()
+    };
+
+    AuthSessionStatus {
+        enabled,
+        auth_mode: state.auth.provider.mode(),
+        authenticated: actor.is_some() || !enabled,
+        actor,
+        permissions,
+    }
+}
+
+async fn authorize_request(
+    state: &AppState,
+    request: &mut Request,
+    required_role: AuthRole,
+) -> Result<(), AppError> {
+    purge_expired_sessions(state).await?;
+
+    let actor = if state.auth.enabled() {
+        current_session_actor(state, request.headers())
+            .await?
+            .ok_or_else(|| AppError::unauthorized(anyhow!("sign in required")))?
+    } else {
+        disabled_actor()
+    };
+
+    if !actor.role.allows(&required_role) {
+        return Err(AppError::forbidden(anyhow!(
+            "the signed-in account is not allowed to perform this action"
+        )));
+    }
+
+    request.extensions_mut().insert(actor);
+    Ok(())
+}
+
+async fn current_session_actor(
+    state: &AppState,
     headers: &HeaderMap,
-) -> Result<Option<String>, AppError> {
-    let Some(token) = session_token_from_headers(cookie_name, headers) else {
+) -> Result<Option<SessionActor>, AppError> {
+    let Some(token) = session_token_from_headers(&state.auth.cookie_name, headers) else {
         return Ok(None);
     };
 
-    let operator_label = sqlx::query_scalar::<_, String>(
+    let Some(account_username) = sqlx::query_scalar::<_, String>(
         r#"
-        select operator_label
+        select account_username
         from ui_sessions
         where token = $1
           and expires_at > now()
         "#,
     )
     .bind(token)
-    .fetch_optional(pool)
-    .await?;
+    .fetch_optional(&state.pool)
+    .await?
+    else {
+        return Ok(None);
+    };
 
-    Ok(operator_label)
+    let Some(actor) = state.auth.provider.resolve_actor(&account_username)? else {
+        sqlx::query("delete from ui_sessions where token = $1")
+            .bind(token)
+            .execute(&state.pool)
+            .await?;
+        return Ok(None);
+    };
+
+    touch_session(state, token, &actor).await?;
+    Ok(Some(actor))
 }
 
-async fn purge_expired_sessions(pool: &PgPool) -> Result<(), AppError> {
+async fn touch_session(
+    state: &AppState,
+    token: &str,
+    actor: &SessionActor,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        update ui_sessions
+        set operator_label = $2,
+            display_name = $2,
+            role = $3,
+            last_seen_at = now()
+        where token = $1
+        "#,
+    )
+    .bind(token)
+    .bind(&actor.display_name)
+    .bind(actor_role_value(&actor.role))
+    .execute(&state.pool)
+    .await?;
+    Ok(())
+}
+
+async fn purge_expired_sessions(state: &AppState) -> Result<(), AppError> {
     sqlx::query("delete from ui_sessions where expires_at <= now()")
-        .execute(pool)
+        .execute(&state.pool)
         .await?;
     Ok(())
+}
+
+fn disabled_actor() -> SessionActor {
+    SessionActor {
+        username: DISABLED_AUTH_USERNAME.to_string(),
+        display_name: DISABLED_AUTH_DISPLAY_NAME.to_string(),
+        role: AuthRole::Admin,
+    }
+}
+
+fn actor_role_value(role: &AuthRole) -> &'static str {
+    match role {
+        AuthRole::Viewer => "viewer",
+        AuthRole::Operator => "operator",
+        AuthRole::Admin => "admin",
+    }
 }
 
 fn new_session_token() -> String {
@@ -215,13 +328,16 @@ fn session_cookie_value(
     cookie_name: &str,
     token: Option<&str>,
     max_age: Option<Duration>,
+    secure: bool,
 ) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+
     match (token, max_age) {
         (Some(token), Some(max_age)) => format!(
-            "{cookie_name}={token}; HttpOnly; Path=/; SameSite=Strict; Max-Age={}",
+            "{cookie_name}={token}; HttpOnly; Path=/; SameSite=Strict{secure}; Max-Age={}",
             max_age.as_secs()
         ),
-        _ => format!("{cookie_name}=; HttpOnly; Path=/; SameSite=Strict; Max-Age=0"),
+        _ => format!("{cookie_name}=; HttpOnly; Path=/; SameSite=Strict{secure}; Max-Age=0"),
     }
 }
 

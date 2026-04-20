@@ -1,5 +1,6 @@
 //! Shared runtime state for the orchestration API.
 
+use crate::auth::AuthProvider;
 use crate::models::UiEvent;
 use async_nats::Client as NatsClient;
 use reqwest::Client as HttpClient;
@@ -18,15 +19,15 @@ pub(crate) struct AssistantRuntime {
 /// Runtime settings for the web UI session boundary.
 #[derive(Clone)]
 pub(crate) struct AuthRuntime {
-    pub(crate) password: Option<String>,
-    pub(crate) operator_label: String,
+    pub(crate) provider: AuthProvider,
     pub(crate) cookie_name: String,
+    pub(crate) cookie_secure: bool,
     pub(crate) session_ttl: Duration,
 }
 
 impl AuthRuntime {
     pub(crate) fn enabled(&self) -> bool {
-        self.password.is_some()
+        self.provider.enabled()
     }
 }
 

@@ -102,6 +102,7 @@ pub(crate) struct ApprovalRecord {
     pub(crate) status: String,
     pub(crate) summary: String,
     pub(crate) resolved_by: Option<String>,
+    pub(crate) resolved_by_display_name: Option<String>,
     pub(crate) resolution_reason: Option<String>,
     pub(crate) created_at: DateTime<Utc>,
     pub(crate) resolved_at: Option<DateTime<Utc>>,

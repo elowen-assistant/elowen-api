@@ -4,6 +4,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::auth::{AuthMode, AuthPermission, SessionActor};
+
 use super::persistence::{ApprovalRecord, JobRecord, MessageRecord, SummaryRecord, ThreadRecord};
 
 /// Lightweight browser notification that tells the UI which REST resource changed.
@@ -139,7 +141,6 @@ pub(crate) struct CreateJobRequest {
 #[derive(Debug, Deserialize)]
 pub(crate) struct ResolveApprovalRequest {
     pub(crate) status: String,
-    pub(crate) resolved_by: Option<String>,
     pub(crate) reason: Option<String>,
 }
 
@@ -343,12 +344,15 @@ pub(crate) struct JobApprovalCommand {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct LoginRequest {
+    pub(crate) username: Option<String>,
     pub(crate) password: String,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct AuthSessionStatus {
     pub(crate) enabled: bool,
+    pub(crate) auth_mode: AuthMode,
     pub(crate) authenticated: bool,
-    pub(crate) operator_label: Option<String>,
+    pub(crate) actor: Option<SessionActor>,
+    pub(crate) permissions: Vec<AuthPermission>,
 }

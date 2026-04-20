@@ -20,6 +20,7 @@ pub(crate) async fn load_job_approvals(
             status,
             summary,
             resolved_by,
+            resolved_by_display_name,
             resolution_reason,
             created_at,
             resolved_at,
@@ -50,6 +51,7 @@ pub(crate) async fn load_approval_record(
             status,
             summary,
             resolved_by,
+            resolved_by_display_name,
             resolution_reason,
             created_at,
             resolved_at,
@@ -69,6 +71,7 @@ pub(crate) async fn resolve_approval_record(
     approval_id: &str,
     status: &str,
     resolved_by: Option<String>,
+    resolved_by_display_name: Option<String>,
     reason: Option<String>,
 ) -> Result<ApprovalRecord, AppError> {
     let approval = sqlx::query_as::<_, ApprovalRecord>(
@@ -76,7 +79,8 @@ pub(crate) async fn resolve_approval_record(
         update approvals
         set status = $2,
             resolved_by = $3,
-            resolution_reason = $4,
+            resolved_by_display_name = $4,
+            resolution_reason = $5,
             resolved_at = now(),
             updated_at = now()
         where id = $1
@@ -89,6 +93,7 @@ pub(crate) async fn resolve_approval_record(
             status,
             summary,
             resolved_by,
+            resolved_by_display_name,
             resolution_reason,
             created_at,
             resolved_at,
@@ -98,6 +103,7 @@ pub(crate) async fn resolve_approval_record(
     .bind(approval_id)
     .bind(status)
     .bind(resolved_by)
+    .bind(resolved_by_display_name)
     .bind(reason)
     .fetch_optional(pool)
     .await?;
@@ -116,6 +122,7 @@ pub(crate) async fn reset_approval_to_pending(
         update approvals
         set status = 'pending',
             resolved_by = null,
+            resolved_by_display_name = null,
             resolution_reason = null,
             resolved_at = null,
             updated_at = now()
@@ -144,6 +151,7 @@ pub(crate) async fn upsert_pending_push_approval(
             status,
             summary,
             resolved_by,
+            resolved_by_display_name,
             resolution_reason,
             created_at,
             resolved_at,
@@ -176,6 +184,7 @@ pub(crate) async fn upsert_pending_push_approval(
             status,
             summary,
             resolved_by,
+            resolved_by_display_name,
             resolution_reason,
             created_at,
             resolved_at,
