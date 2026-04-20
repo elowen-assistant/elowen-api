@@ -18,8 +18,9 @@ use crate::{
     routes::{
         create_chat_dispatch, create_job, create_message, create_thread, create_thread_chat,
         dispatch_thread_message, get_auth_session, get_device, get_job, get_job_notes, get_thread,
-        get_thread_notes, list_devices, list_jobs, list_thread_jobs, list_threads, login, logout,
-        probe_device, promote_job_note, register_device, registration_challenge,
+        get_thread_notes, list_devices, list_jobs, list_repositories, list_thread_jobs,
+        list_threads, login, logout, probe_device, promote_job_note, register_device,
+        registration_challenge,
         require_admin_session, require_operator_session, require_viewer_session, resolve_approval,
         stream_ui_events,
     },
@@ -187,6 +188,9 @@ pub async fn run() -> anyhow::Result<()> {
         ))
         .with_state(state.clone());
     let operator_api = Router::new()
+        .route("/repositories", get(list_repositories))
+        .route("/devices", get(list_devices))
+        .route("/devices/{device_id}", get(get_device))
         .route("/threads", post(create_thread))
         .route("/threads/{thread_id}/messages", post(create_message))
         .route("/threads/{thread_id}/chat", post(create_thread_chat))
@@ -207,8 +211,6 @@ pub async fn run() -> anyhow::Result<()> {
         .with_state(state.clone());
     let admin_api = Router::new()
         .route("/approvals/{approval_id}/resolve", post(resolve_approval))
-        .route("/devices", get(list_devices))
-        .route("/devices/{device_id}", get(get_device))
         .route(
             "/devices/{device_id}/availability-probe",
             post(probe_device),

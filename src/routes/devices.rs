@@ -7,6 +7,7 @@ use axum::{
     http::StatusCode,
 };
 use chrono::Utc;
+use std::collections::BTreeMap;
 use tokio::time::timeout;
 use ulid::Ulid;
 
@@ -18,8 +19,9 @@ use crate::{
     formatting::{sanitize_optional_string, sanitize_string_list},
     models::{
         AvailabilityProbeMessage, AvailabilitySnapshot, DeviceMetadata, DeviceRecord,
-        ProbeDeviceRequest, RegisterDeviceRequest,
+        DeviceRepository, ProbeDeviceRequest, RegisterDeviceRequest, RepositoryOption,
     },
+    services::jobs::selectable_repositories,
     services::ui_events::{device_ui_event, publish_ui_event},
     state::AppState,
     trust::verify_registration_trust,
@@ -37,6 +39,26 @@ pub(crate) async fn get_device(
 ) -> Result<Json<DeviceRecord>, AppError> {
     let device: DeviceRecord = load_device_row(&state.pool, &device_id).await?.into();
     Ok(Json(device))
+}
+
+pub(crate) async fn list_repositories(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<RepositoryOption>>, AppError> {
+    let devices = load_devices(&state.pool).await?;
+    let mut counts = BTreeMap::<String, usize>::new();
+
+    for device in devices {
+        for repository in selectable_repositories(&device) {
+            *counts.entry(repository.name).or_default() += 1;
+        }
+    }
+
+    Ok(Json(
+        counts
+            .into_iter()
+            .map(|(name, device_count)| RepositoryOption { name, device_count })
+            .collect(),
+    ))
 }
 
 pub(crate) async fn register_device(
@@ -73,7 +95,10 @@ pub(crate) async fn register_device(
     let metadata = DeviceMetadata {
         allowed_repos: sanitize_string_list(request.allowed_repos),
         allowed_repo_roots: sanitize_string_list(request.allowed_repo_roots),
+        hidden_repos: sanitize_string_list(request.hidden_repos),
+        excluded_repo_paths: sanitize_string_list(request.excluded_repo_paths),
         discovered_repos: sanitize_string_list(request.discovered_repos),
+        repositories: sanitize_device_repositories(request.repositories),
         capabilities: sanitize_string_list(request.capabilities),
         registered_at: existing_metadata
             .as_ref()
@@ -120,6 +145,35 @@ pub(crate) async fn register_device(
     publish_ui_event(&state, device_ui_event(&device.id));
 
     Ok((status, Json(device)))
+}
+
+fn sanitize_device_repositories(repositories: Vec<DeviceRepository>) -> Vec<DeviceRepository> {
+    let mut sanitized = repositories
+        .into_iter()
+        .filter_map(|repository| {
+            let name = repository.name.trim();
+            if name.is_empty() {
+                return None;
+            }
+
+            let mut branches = repository
+                .branches
+                .into_iter()
+                .map(|branch| branch.trim().to_string())
+                .filter(|branch| !branch.is_empty())
+                .collect::<Vec<_>>();
+            branches.sort();
+            branches.dedup();
+
+            Some(DeviceRepository {
+                name: name.to_string(),
+                branches,
+            })
+        })
+        .collect::<Vec<_>>();
+    sanitized.sort();
+    sanitized.dedup();
+    sanitized
 }
 
 pub(crate) async fn probe_device(

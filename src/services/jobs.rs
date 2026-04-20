@@ -1,6 +1,7 @@
 //! Job orchestration helpers used by route handlers.
 
 use anyhow::{Context, anyhow};
+use std::collections::BTreeSet;
 use chrono::Utc;
 use serde_json::json;
 use ulid::Ulid;
@@ -14,8 +15,8 @@ use crate::{
     error::AppError,
     formatting::{sanitize_optional_string, slugify},
     models::{
-        ApprovalRecord, CreateJobRequest, JobApprovalCommand, JobDetail, JobDispatchMessage,
-        JobRecord,
+        ApprovalRecord, CreateJobRequest, DeviceRepository, JobApprovalCommand, JobDetail,
+        JobDispatchMessage, JobRecord,
     },
     services::notes::load_related_job_notes,
     state::AppState,
@@ -127,12 +128,33 @@ pub(crate) async fn create_job_record(
     )
     .await?;
 
-    let availability = crate::services::jobs::routes_shim::probe_device_via_nats(
+    let availability = match crate::services::jobs::routes_shim::probe_device_via_nats(
         &state.nats,
         &target_device.id,
         Some(job_id.clone()),
     )
-    .await?;
+    .await
+    {
+        Ok(availability) => availability,
+        Err(error) => {
+            crate::db::jobs::update_job_state(&state.pool, &job_id, "pending", None, None, None)
+                .await?;
+            insert_job_event(
+                &state.pool,
+                &job_id,
+                &correlation_id,
+                "job.probe_result",
+                json!({
+                    "correlation_id": correlation_id.clone(),
+                    "available": false,
+                    "reason": error.error.to_string(),
+                    "probe_error": true,
+                }),
+            )
+            .await?;
+            return load_job_record(&state.pool, &job_id).await;
+        }
+    };
 
     insert_job_event(
         &state.pool,
@@ -274,9 +296,7 @@ fn ensure_repo_allowed(
         return Ok(());
     }
 
-    if device.allowed_repos.iter().any(|repo| repo == repo_name)
-        || device.discovered_repos.iter().any(|repo| repo == repo_name)
-    {
+    if selectable_repo_names(device).iter().any(|repo| repo == repo_name) {
         return Ok(());
     }
 
@@ -289,6 +309,64 @@ fn device_has_repo_scope(device: &crate::models::DeviceRecord) -> bool {
     !device.allowed_repos.is_empty()
         || !device.allowed_repo_roots.is_empty()
         || !device.discovered_repos.is_empty()
+}
+
+pub(crate) fn selectable_repo_names(device: &crate::models::DeviceRecord) -> Vec<String> {
+    selectable_repositories(device)
+        .into_iter()
+        .map(|repository| repository.name)
+        .collect()
+}
+
+pub(crate) fn selectable_repositories(
+    device: &crate::models::DeviceRecord,
+) -> Vec<DeviceRepository> {
+    let hidden = device
+        .hidden_repos
+        .iter()
+        .map(|repo| repo.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut repositories = BTreeSet::new();
+
+    for repository in &device.repositories {
+        let name = repository.name.trim();
+        if name.is_empty() || hidden.contains(name) {
+            continue;
+        }
+
+        let mut branches = repository
+            .branches
+            .iter()
+            .map(|branch| branch.trim())
+            .filter(|branch| !branch.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        branches.sort();
+        branches.dedup();
+        repositories.insert(DeviceRepository {
+            name: name.to_string(),
+            branches,
+        });
+    }
+
+    for repo in device
+        .allowed_repos
+        .iter()
+        .chain(device.discovered_repos.iter())
+        .map(|repo| repo.trim())
+        .filter(|repo| !repo.is_empty())
+    {
+        if hidden.contains(repo) {
+            continue;
+        }
+
+        repositories.insert(DeviceRepository {
+            name: repo.to_string(),
+            branches: Vec::new(),
+        });
+    }
+
+    repositories.into_iter().collect()
 }
 
 pub(crate) async fn publish_push_approval_command(
@@ -366,5 +444,59 @@ pub(crate) mod routes_shim {
         }
 
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::selectable_repo_names;
+    use crate::models::DeviceRecord;
+    use chrono::Utc;
+
+    fn sample_device() -> DeviceRecord {
+        DeviceRecord {
+            id: "device-1".to_string(),
+            name: "Laptop".to_string(),
+            primary_flag: true,
+            allowed_repos: vec!["elowen-api".to_string()],
+            allowed_repo_roots: vec!["D:\\Projects".to_string()],
+            hidden_repos: vec!["elowen-ui".to_string()],
+            excluded_repo_paths: vec!["D:\\Projects\\archive".to_string()],
+            discovered_repos: vec![
+                "elowen-api".to_string(),
+                "elowen-ui".to_string(),
+                "elowen-platform".to_string(),
+            ],
+            repositories: vec![
+                DeviceRepository {
+                    name: "elowen-api".to_string(),
+                    branches: vec!["main".to_string()],
+                },
+                DeviceRepository {
+                    name: "elowen-ui".to_string(),
+                    branches: vec!["main".to_string()],
+                },
+                DeviceRepository {
+                    name: "elowen-platform".to_string(),
+                    branches: vec!["main".to_string()],
+                },
+            ],
+            capabilities: vec!["codex".to_string()],
+            registered_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            last_probe: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn selectable_repo_names_hide_hidden_repositories() {
+        let names = selectable_repo_names(&sample_device());
+
+        assert_eq!(
+            names,
+            vec!["elowen-api".to_string(), "elowen-platform".to_string()]
+        );
     }
 }
