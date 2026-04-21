@@ -5,11 +5,25 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
 
-use crate::{error::AppError, models::DeviceRegistrationTrustProof, state::AppState};
+use crate::{
+    error::AppError,
+    models::{DeviceRegistrationTrustProof, OrchestratorTrustSigner, RegistrationTrustIntent},
+    state::AppState,
+};
 
+#[derive(Debug, Clone)]
 pub(crate) struct TrustedRegistration {
     pub(crate) edge_public_key: String,
     pub(crate) registered_at: DateTime<Utc>,
+    pub(crate) orchestrator_key_id: String,
+    pub(crate) orchestrator_public_key: String,
+    pub(crate) registration_intent: RegistrationTrustIntent,
+}
+
+struct ConfiguredOrchestratorSigner {
+    key_id: String,
+    public_key: String,
+    signing_key: SigningKey,
 }
 
 pub(crate) fn verify_registration_trust(
@@ -30,10 +44,40 @@ pub(crate) fn verify_registration_trust(
         return Ok(None);
     };
 
-    let signing_key = load_orchestrator_signing_key(state)?;
-    let orchestrator_public_key = URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes());
-    let orchestrator_verifying_key =
-        decode_verifying_key(&orchestrator_public_key, "orchestrator public key")?;
+    if state
+        .trust
+        .revoked_edge_public_keys
+        .iter()
+        .any(|key| key == &proof.edge_public_key)
+    {
+        return Err(AppError::unauthorized(anyhow!(
+            "edge public key has been revoked"
+        )));
+    }
+
+    let signers = load_orchestrator_signers(state)?;
+    let signer = match signers.iter().find(|candidate| {
+        candidate.public_key == proof.orchestrator_public_key
+            || candidate.key_id == proof.orchestrator_key_id
+    }) {
+        Some(signer)
+            if signer.public_key == proof.orchestrator_public_key
+                && signer.key_id == proof.orchestrator_key_id =>
+        {
+            signer
+        }
+        Some(_) => {
+            return Err(AppError::unauthorized(anyhow!(
+                "orchestrator signer identity did not match configured trust anchors"
+            )));
+        }
+        None => {
+            return Err(AppError::unauthorized(anyhow!(
+                "orchestrator signer is not trusted for registration"
+            )));
+        }
+    };
+
     let challenge_signature = decode_signature(
         &proof.orchestrator_signature,
         "orchestrator challenge signature",
@@ -44,7 +88,9 @@ pub(crate) fn verify_registration_trust(
         proof.orchestrator_challenge_issued_at,
     );
 
-    orchestrator_verifying_key
+    signer
+        .signing_key
+        .verifying_key()
         .verify(challenge_payload.as_bytes(), &challenge_signature)
         .map_err(|_| {
             AppError::unauthorized(anyhow!(
@@ -70,17 +116,65 @@ pub(crate) fn verify_registration_trust(
     Ok(Some(TrustedRegistration {
         edge_public_key: proof.edge_public_key.clone(),
         registered_at: now,
+        orchestrator_key_id: signer.key_id.clone(),
+        orchestrator_public_key: signer.public_key.clone(),
+        registration_intent: proof.registration_intent.clone(),
     }))
 }
 
-pub(crate) fn load_orchestrator_signing_key(state: &AppState) -> Result<SigningKey, AppError> {
-    let key = state
-        .trust
-        .orchestrator_signing_key
-        .as_deref()
+pub(crate) fn load_active_orchestrator_signer(
+    state: &AppState,
+) -> Result<(String, String, SigningKey), AppError> {
+    let signer = load_orchestrator_signers(state)?
+        .into_iter()
+        .next()
         .ok_or_else(|| AppError::conflict(anyhow!("orchestrator signing key is not configured")))?;
+    Ok((signer.key_id, signer.public_key, signer.signing_key))
+}
 
-    decode_signing_key(key, "orchestrator signing key")
+fn load_orchestrator_signers(
+    state: &AppState,
+) -> Result<Vec<ConfiguredOrchestratorSigner>, AppError> {
+    if state.trust.orchestrator_signing_keys.is_empty() {
+        return Err(AppError::conflict(anyhow!(
+            "orchestrator signing key is not configured"
+        )));
+    }
+
+    state
+        .trust
+        .orchestrator_signing_keys
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let signing_key = decode_signing_key(value, "orchestrator signing key")?;
+            let public_key = URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes());
+            Ok(ConfiguredOrchestratorSigner {
+                key_id: orchestrator_key_id(&public_key, index),
+                public_key,
+                signing_key,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn exported_orchestrator_signers(
+    state: &AppState,
+) -> Result<Vec<OrchestratorTrustSigner>, AppError> {
+    Ok(load_orchestrator_signers(state)?
+        .into_iter()
+        .enumerate()
+        .map(|(index, signer)| OrchestratorTrustSigner {
+            key_id: signer.key_id,
+            public_key: signer.public_key,
+            active: index == 0,
+        })
+        .collect())
+}
+
+pub(crate) fn orchestrator_key_id(public_key: &str, index: usize) -> String {
+    let prefix = public_key.chars().take(12).collect::<String>();
+    format!("orchestrator-{}-{prefix}", index + 1)
 }
 
 pub(crate) fn decode_signing_key(value: &str, label: &str) -> Result<SigningKey, AppError> {
@@ -139,10 +233,12 @@ pub(crate) fn edge_registration_payload(
     proof: &DeviceRegistrationTrustProof,
 ) -> String {
     format!(
-        "elowen-edge-registration\n{device_id}\n{name}\n{primary_flag}\n{}\n{}\n{}\n{}",
+        "elowen-edge-registration\n{device_id}\n{name}\n{primary_flag}\n{}\n{}\n{}\n{}\n{}\n{}",
         proof.orchestrator_challenge_id,
         proof.orchestrator_challenge,
         proof.orchestrator_challenge_issued_at.to_rfc3339(),
+        proof.orchestrator_key_id,
+        proof.orchestrator_public_key,
         proof.edge_public_key
     )
 }

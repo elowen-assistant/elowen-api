@@ -21,7 +21,10 @@ use crate::{
     models::{AuthSessionStatus, LoginRequest, RegistrationChallengeResponse},
     services::ui_events::stream_from_broadcast,
     state::AppState,
-    trust::{load_orchestrator_signing_key, orchestrator_challenge_payload},
+    trust::{
+        exported_orchestrator_signers, load_active_orchestrator_signer,
+        orchestrator_challenge_payload,
+    },
 };
 
 const DISABLED_AUTH_USERNAME: &str = "local-operator";
@@ -45,7 +48,8 @@ pub(crate) async fn get_auth_session(
 pub(crate) async fn registration_challenge(
     State(state): State<AppState>,
 ) -> Result<Json<RegistrationChallengeResponse>, AppError> {
-    let signing_key = load_orchestrator_signing_key(&state)?;
+    let (orchestrator_key_id, orchestrator_public_key, signing_key) =
+        load_active_orchestrator_signer(&state)?;
     let challenge_id = Ulid::new().to_string();
     let mut challenge_bytes = [0_u8; 32];
     rand::thread_rng().fill_bytes(&mut challenge_bytes);
@@ -58,7 +62,9 @@ pub(crate) async fn registration_challenge(
         challenge_id,
         challenge,
         issued_at,
-        orchestrator_public_key: URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes()),
+        orchestrator_key_id,
+        orchestrator_public_key,
+        trusted_signers: exported_orchestrator_signers(&state)?,
         signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
     }))
 }

@@ -128,6 +128,10 @@ pub(crate) struct DeviceRow {
 impl From<DeviceRow> for DeviceRecord {
     fn from(row: DeviceRow) -> Self {
         let metadata = row.metadata.0;
+        let trust = metadata.trust.clone().normalized(
+            metadata.edge_public_key,
+            metadata.last_trusted_registration_at,
+        );
         Self {
             id: row.id,
             name: row.name,
@@ -142,6 +146,7 @@ impl From<DeviceRow> for DeviceRecord {
             registered_at: metadata.registered_at.unwrap_or(row.created_at),
             last_seen_at: metadata.last_seen_at.unwrap_or(row.updated_at),
             last_probe: metadata.last_probe,
+            trust,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }

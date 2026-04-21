@@ -1,9 +1,9 @@
 //! Job orchestration helpers used by route handlers.
 
 use anyhow::{Context, anyhow};
-use std::collections::BTreeSet;
 use chrono::Utc;
 use serde_json::json;
+use std::collections::BTreeSet;
 use ulid::Ulid;
 
 use crate::{
@@ -296,7 +296,10 @@ fn ensure_repo_allowed(
         return Ok(());
     }
 
-    if selectable_repo_names(device).iter().any(|repo| repo == repo_name) {
+    if selectable_repo_names(device)
+        .iter()
+        .any(|repo| repo == repo_name)
+    {
         return Ok(());
     }
 
@@ -315,6 +318,8 @@ pub(crate) fn selectable_repo_names(device: &crate::models::DeviceRecord) -> Vec
     selectable_repositories(device)
         .into_iter()
         .map(|repository| repository.name)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect()
 }
 
@@ -450,7 +455,7 @@ pub(crate) mod routes_shim {
 #[cfg(test)]
 mod tests {
     use super::selectable_repo_names;
-    use crate::models::DeviceRecord;
+    use crate::models::{DeviceRecord, DeviceRepository, DeviceTrustMetadata};
     use chrono::Utc;
 
     fn sample_device() -> DeviceRecord {
@@ -485,6 +490,7 @@ mod tests {
             registered_at: Utc::now(),
             last_seen_at: Utc::now(),
             last_probe: None,
+            trust: DeviceTrustMetadata::default(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

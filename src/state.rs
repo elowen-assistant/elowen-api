@@ -34,8 +34,9 @@ impl AuthRuntime {
 /// Runtime settings for optional edge/orchestrator trust enforcement.
 #[derive(Clone)]
 pub(crate) struct TrustRuntime {
-    pub(crate) orchestrator_signing_key: Option<String>,
+    pub(crate) orchestrator_signing_keys: Vec<String>,
     pub(crate) require_trusted_edge_registration: bool,
+    pub(crate) revoked_edge_public_keys: Vec<String>,
 }
 
 /// Shared application state injected into Axum handlers.

@@ -20,9 +20,8 @@ use crate::{
         dispatch_thread_message, get_auth_session, get_device, get_job, get_job_notes, get_thread,
         get_thread_notes, list_devices, list_jobs, list_repositories, list_thread_jobs,
         list_threads, login, logout, probe_device, promote_job_note, register_device,
-        registration_challenge,
-        require_admin_session, require_operator_session, require_viewer_session, resolve_approval,
-        stream_ui_events,
+        registration_challenge, require_admin_session, require_operator_session,
+        require_viewer_session, resolve_approval, revoke_device_trust, stream_ui_events,
     },
     services::lifecycle::consume_job_lifecycle_events,
     state::{AppState, AssistantRuntime, AuthRuntime, TrustRuntime},
@@ -98,14 +97,22 @@ pub async fn run() -> anyhow::Result<()> {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(14);
-    let orchestrator_signing_key = env::var("ELOWEN_ORCHESTRATOR_SIGNING_KEY")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    let orchestrator_signing_keys = parse_string_list_env("ELOWEN_ORCHESTRATOR_SIGNING_KEYS");
+    let orchestrator_signing_keys = if orchestrator_signing_keys.is_empty() {
+        env::var("ELOWEN_ORCHESTRATOR_SIGNING_KEY")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .into_iter()
+            .collect()
+    } else {
+        orchestrator_signing_keys
+    };
     let require_trusted_edge_registration = env::var("ELOWEN_REQUIRE_TRUSTED_EDGE_REGISTRATION")
         .ok()
         .map(|value| parse_bool(&value))
         .unwrap_or(false);
+    let revoked_edge_public_keys = parse_string_list_env("ELOWEN_REVOKED_EDGE_PUBLIC_KEYS");
 
     let pool = PgPoolOptions::new()
         .max_connections(5)
@@ -163,8 +170,9 @@ pub async fn run() -> anyhow::Result<()> {
             session_ttl: Duration::from_secs(auth_session_days * 24 * 60 * 60),
         },
         trust: TrustRuntime {
-            orchestrator_signing_key,
+            orchestrator_signing_keys,
             require_trusted_edge_registration,
+            revoked_edge_public_keys,
         },
         ui_events,
     };
@@ -215,6 +223,10 @@ pub async fn run() -> anyhow::Result<()> {
             "/devices/{device_id}/availability-probe",
             post(probe_device),
         )
+        .route(
+            "/devices/{device_id}/trust/revoke",
+            post(revoke_device_trust),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_admin_session,
@@ -247,4 +259,30 @@ pub async fn run() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(address).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn parse_string_list_env(key: &str) -> Vec<String> {
+    let Some(value) = env::var(key).ok() else {
+        return Vec::new();
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    if trimmed.starts_with('[')
+        && let Ok(values) = serde_json::from_str::<Vec<String>>(trimmed)
+    {
+        return values
+            .into_iter()
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect();
+    }
+
+    trimmed
+        .split(',')
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect()
 }

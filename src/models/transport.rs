@@ -234,8 +234,129 @@ pub(crate) struct RegistrationChallengeResponse {
     pub(crate) challenge_id: String,
     pub(crate) challenge: String,
     pub(crate) issued_at: DateTime<Utc>,
+    pub(crate) orchestrator_key_id: String,
     pub(crate) orchestrator_public_key: String,
+    pub(crate) trusted_signers: Vec<OrchestratorTrustSigner>,
     pub(crate) signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RegistrationTrustIntent {
+    Enroll,
+    Rotate,
+    Reenroll,
+}
+
+impl Default for RegistrationTrustIntent {
+    fn default() -> Self {
+        Self::Enroll
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DeviceTrustStatus {
+    Untrusted,
+    Trusted,
+    Rotated,
+    Revoked,
+    AttentionRequired,
+}
+
+impl Default for DeviceTrustStatus {
+    fn default() -> Self {
+        Self::Untrusted
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct OrchestratorTrustSigner {
+    pub(crate) key_id: String,
+    pub(crate) public_key: String,
+    pub(crate) active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub(crate) struct DeviceTrustMetadata {
+    #[serde(default)]
+    pub(crate) status: DeviceTrustStatus,
+    #[serde(default)]
+    pub(crate) label: Option<String>,
+    #[serde(default)]
+    pub(crate) summary: Option<String>,
+    #[serde(default)]
+    pub(crate) detail: Option<String>,
+    #[serde(default)]
+    pub(crate) reason: Option<String>,
+    #[serde(default)]
+    pub(crate) enrollment_kind: Option<String>,
+    #[serde(default)]
+    pub(crate) current_edge_public_key: Option<String>,
+    #[serde(default)]
+    pub(crate) previous_edge_public_keys: Vec<String>,
+    #[serde(default)]
+    pub(crate) revoked_edge_public_keys: Vec<String>,
+    #[serde(default)]
+    pub(crate) last_trusted_registration_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    #[serde(alias = "last_rotation_at")]
+    pub(crate) rotated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub(crate) revoked_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub(crate) status_reason: Option<String>,
+    #[serde(default)]
+    pub(crate) last_orchestrator_key_id: Option<String>,
+    #[serde(default)]
+    pub(crate) last_orchestrator_public_key: Option<String>,
+    #[serde(default)]
+    pub(crate) last_registration_intent: Option<RegistrationTrustIntent>,
+    #[serde(default)]
+    pub(crate) updated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub(crate) can_dispatch: Option<bool>,
+    #[serde(default, alias = "attention_needed")]
+    pub(crate) requires_attention: bool,
+}
+
+impl DeviceTrustMetadata {
+    pub(crate) fn normalized(
+        mut self,
+        legacy_edge_public_key: Option<String>,
+        legacy_last_trusted_registration_at: Option<DateTime<Utc>>,
+    ) -> Self {
+        if self.current_edge_public_key.is_none() {
+            self.current_edge_public_key = legacy_edge_public_key;
+        }
+
+        if self.last_trusted_registration_at.is_none() {
+            self.last_trusted_registration_at = legacy_last_trusted_registration_at;
+        }
+
+        self.previous_edge_public_keys.sort();
+        self.previous_edge_public_keys.dedup();
+        self.revoked_edge_public_keys.sort();
+        self.revoked_edge_public_keys.dedup();
+
+        if self.revoked_at.is_some() {
+            self.status = DeviceTrustStatus::Revoked;
+        } else if matches!(self.status, DeviceTrustStatus::Untrusted)
+            && self.current_edge_public_key.is_some()
+        {
+            self.status = DeviceTrustStatus::Trusted;
+        }
+
+        self.label.get_or_insert_with(|| match self.status {
+            DeviceTrustStatus::Trusted => "Trusted".to_string(),
+            DeviceTrustStatus::Rotated => "Rotated".to_string(),
+            DeviceTrustStatus::Revoked => "Revoked".to_string(),
+            DeviceTrustStatus::Untrusted => "Untrusted".to_string(),
+            DeviceTrustStatus::AttentionRequired => "Needs Attention".to_string(),
+        });
+
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,9 +364,13 @@ pub(crate) struct DeviceRegistrationTrustProof {
     pub(crate) orchestrator_challenge_id: String,
     pub(crate) orchestrator_challenge: String,
     pub(crate) orchestrator_challenge_issued_at: DateTime<Utc>,
+    pub(crate) orchestrator_key_id: String,
+    pub(crate) orchestrator_public_key: String,
     pub(crate) orchestrator_signature: String,
     pub(crate) edge_public_key: String,
     pub(crate) edge_signature: String,
+    #[serde(default)]
+    pub(crate) registration_intent: RegistrationTrustIntent,
 }
 
 #[derive(Debug, Deserialize)]
@@ -282,7 +407,11 @@ pub(crate) struct DeviceMetadata {
     pub(crate) registered_at: Option<DateTime<Utc>>,
     pub(crate) last_seen_at: Option<DateTime<Utc>>,
     pub(crate) last_probe: Option<AvailabilitySnapshot>,
+    #[serde(default)]
+    pub(crate) trust: DeviceTrustMetadata,
+    #[serde(default, skip_serializing)]
     pub(crate) edge_public_key: Option<String>,
+    #[serde(default, skip_serializing)]
     pub(crate) last_trusted_registration_at: Option<DateTime<Utc>>,
 }
 
@@ -301,8 +430,15 @@ pub(crate) struct DeviceRecord {
     pub(crate) registered_at: DateTime<Utc>,
     pub(crate) last_seen_at: DateTime<Utc>,
     pub(crate) last_probe: Option<AvailabilitySnapshot>,
+    pub(crate) trust: DeviceTrustMetadata,
     pub(crate) created_at: DateTime<Utc>,
     pub(crate) updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct RevokeDeviceTrustRequest {
+    pub(crate) edge_public_key: Option<String>,
+    pub(crate) reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

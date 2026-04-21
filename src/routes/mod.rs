@@ -12,7 +12,9 @@ pub(crate) use auth::{
     get_auth_session, login, logout, registration_challenge, require_admin_session,
     require_operator_session, require_session_actor, require_viewer_session, stream_ui_events,
 };
-pub(crate) use devices::{get_device, list_devices, list_repositories, probe_device, register_device};
+pub(crate) use devices::{
+    get_device, list_devices, list_repositories, probe_device, register_device, revoke_device_trust,
+};
 pub(crate) use jobs::{get_job, list_jobs};
 pub(crate) use notes::{get_job_notes, get_thread_notes, promote_job_note};
 pub(crate) use threads::{
