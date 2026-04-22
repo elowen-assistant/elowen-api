@@ -8,8 +8,8 @@ use crate::{
     error::AppError,
     formatting::{derive_job_title_from_message, sanitize_optional_string},
     models::{
-        ExecutionDraft, ExecutionIntent, JobRecord, MessageRecord, NoteRecord, SummaryRecord,
-        ThreadRecord,
+        ExecutionDraft, ExecutionIntent, JobRecord, MessageRecord, RelatedNoteContext,
+        SummaryRecord, ThreadRecord,
     },
     state::AppState,
 };
@@ -19,7 +19,7 @@ pub(crate) async fn generate_conversational_reply(
     thread: &ThreadRecord,
     messages: &[MessageRecord],
     jobs: &[JobRecord],
-    related_notes: &[NoteRecord],
+    related_notes: &[RelatedNoteContext],
     execution_draft: Option<&ExecutionDraft>,
 ) -> Result<String, AppError> {
     if state.assistant.api_key.is_some() {
@@ -54,7 +54,7 @@ async fn request_assistant_reply(
     thread: &ThreadRecord,
     messages: &[MessageRecord],
     jobs: &[JobRecord],
-    related_notes: &[NoteRecord],
+    related_notes: &[RelatedNoteContext],
     execution_draft: Option<&ExecutionDraft>,
 ) -> Result<String, AppError> {
     let api_key = state
@@ -116,7 +116,7 @@ async fn build_conversation_input(
     thread: &ThreadRecord,
     messages: &[MessageRecord],
     jobs: &[JobRecord],
-    related_notes: &[NoteRecord],
+    related_notes: &[RelatedNoteContext],
     execution_draft: Option<&ExecutionDraft>,
 ) -> Result<String, AppError> {
     let latest_user = messages
@@ -252,7 +252,7 @@ fn format_job_context(job_context: &[ConversationJobContext]) -> String {
         .join("\n")
 }
 
-fn format_note_context(notes: &[NoteRecord], limit: usize) -> String {
+fn format_note_context(notes: &[RelatedNoteContext], limit: usize) -> String {
     if notes.is_empty() {
         return "- none".to_string();
     }
@@ -261,12 +261,27 @@ fn format_note_context(notes: &[NoteRecord], limit: usize) -> String {
         .iter()
         .take(limit)
         .map(|note| {
+            let excerpt = note
+                .detail_excerpt
+                .as_deref()
+                .map(|excerpt| format!(" | excerpt {}", summarize_text(excerpt, 180)))
+                .unwrap_or_default();
+            let reasons = if note.note.match_reasons.is_empty() {
+                "none".to_string()
+            } else {
+                note.note.match_reasons.join(", ")
+            };
             format!(
-                "- [Note {}] kind `{}` updated `{}`: {}",
-                note.title,
-                note.source_kind.as_deref().unwrap_or("general"),
-                note.updated_at.to_rfc3339(),
-                summarize_text(&note.summary, 200)
+                "- [Note {}] role `{}` source `{}` kind `{}` score `{:.0}` reasons [{}] updated `{}`: {}{}",
+                note.note.title,
+                note.memory_role,
+                note.source_label,
+                note.note.source_kind.as_deref().unwrap_or("general"),
+                note.note.relevance_score,
+                reasons,
+                note.note.updated_at.to_rfc3339(),
+                summarize_text(&note.note.summary, 200),
+                excerpt,
             )
         })
         .collect::<Vec<_>>()
@@ -340,7 +355,7 @@ fn build_fallback_conversational_reply(
     thread: &ThreadRecord,
     messages: &[MessageRecord],
     jobs: &[JobRecord],
-    related_notes: &[NoteRecord],
+    related_notes: &[RelatedNoteContext],
     execution_draft: Option<&ExecutionDraft>,
 ) -> String {
     let latest_user = messages
@@ -399,8 +414,8 @@ fn build_fallback_conversational_reply(
     if let Some(note) = related_notes.first() {
         return format!(
             "I'm here in conversational mode. I can answer questions about this thread, help plan work, or prepare an explicit laptop dispatch when needed.\n\nThe closest related note I found is `{}`: {}",
-            note.title,
-            summarize_text(&note.summary, 160)
+            note.note.title,
+            summarize_text(&note.note.summary, 160)
         );
     }
 

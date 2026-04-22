@@ -79,6 +79,38 @@ pub(crate) struct NoteRecord {
     pub(crate) source_id: Option<String>,
     pub(crate) current_revision_id: String,
     pub(crate) updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub(crate) relevance_score: f64,
+    #[serde(default)]
+    pub(crate) match_reasons: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub(crate) struct NoteRevisionRecord {
+    pub(crate) revision_id: String,
+    pub(crate) note_id: String,
+    pub(crate) version: i32,
+    pub(crate) summary: String,
+    pub(crate) body_markdown: String,
+    pub(crate) frontmatter: Value,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) previous_revision_id: Option<String>,
+    pub(crate) authored_by: Option<NoteAuthor>,
+    pub(crate) source_references: Vec<NoteSourceReference>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub(crate) struct NoteDetailRecord {
+    pub(crate) note: NoteRecord,
+    pub(crate) revision: NoteRevisionRecord,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RelatedNoteContext {
+    pub(crate) note: NoteRecord,
+    pub(crate) memory_role: String,
+    pub(crate) source_label: String,
+    pub(crate) detail_excerpt: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,14 +195,14 @@ pub(crate) struct PromoteNoteRequest {
     pub(crate) source_references: Vec<NoteSourceReference>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct NoteAuthor {
     pub(crate) actor_type: String,
     pub(crate) actor_id: String,
     pub(crate) display_name: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct NoteSourceReference {
     pub(crate) source_kind: String,
     pub(crate) source_id: String,

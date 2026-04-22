@@ -30,7 +30,7 @@ use crate::{
             summarize_text,
         },
         jobs::{create_job_record, load_job_detail_from_record},
-        notes::load_related_thread_notes,
+        notes::{load_related_thread_note_context, load_related_thread_notes},
         ui_events::{job_ui_event, publish_ui_event, thread_ui_event},
     },
     state::AppState,
@@ -129,14 +129,15 @@ pub(crate) async fn create_thread_chat(
     let thread = load_thread_record(&state.pool, &thread_id).await?;
     let messages = load_thread_messages(&state.pool, &thread_id).await?;
     let jobs = load_thread_jobs(&state.pool, &thread_id).await?;
-    let related_notes = load_related_thread_notes(&state, &thread, &messages, &jobs).await?;
+    let related_note_context =
+        load_related_thread_note_context(&state, &thread, &messages, &jobs).await?;
     let execution_draft = maybe_build_execution_draft(&messages, &jobs);
     let assistant_reply = generate_conversational_reply(
         &state,
         &thread,
         &messages,
         &jobs,
-        &related_notes,
+        &related_note_context,
         execution_draft.as_ref(),
     )
     .await?;

@@ -19,8 +19,8 @@ use crate::{
     services::{
         conversation::summarize_text,
         notes::{
-            load_related_job_notes, load_related_thread_notes, promote_note_to_service,
-            search_notes,
+            SearchNotesRequest, load_related_job_notes, load_related_thread_notes,
+            promote_note_to_service, search_notes,
         },
         ui_events::{job_ui_event, publish_ui_event},
     },
@@ -59,11 +59,19 @@ pub(crate) async fn promote_job_note(
     let actor = require_session_actor(actor);
     let job = load_job_record(&state.pool, &job_id).await?;
     let summary = load_current_job_summary(&state.pool, &job_id).await?;
-    let existing_note_id = search_notes(&state, None, Some("job"), Some(job.id.as_str()), 1)
-        .await?
-        .into_iter()
-        .next()
-        .map(|note| note.note_id);
+    let existing_note_id = search_notes(
+        &state,
+        SearchNotesRequest {
+            source_kind: Some("job"),
+            source_id: Some(job.id.as_str()),
+            limit: 1,
+            ..SearchNotesRequest::default()
+        },
+    )
+    .await?
+    .into_iter()
+    .next()
+    .map(|note| note.note_id);
     let default_body = summary
         .as_ref()
         .map(|record| record.content.clone())
