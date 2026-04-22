@@ -1,6 +1,12 @@
 //! HTTP, NATS, and UI-facing wire models for the orchestration API.
 
 use chrono::{DateTime, Utc};
+pub(crate) use elowen_contracts::{
+    AvailabilityProbeMessage, AvailabilitySnapshot, DeviceRegistrationTrustProof, DeviceRepository,
+    ExecutionIntent, JobApprovalCommand, JobDispatchMessage, JobLifecycleEvent,
+    OrchestratorTrustSigner, RegisterDeviceRequest, RegistrationChallengeResponse,
+    RegistrationTrustIntent,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -16,22 +22,6 @@ pub(crate) struct UiEvent {
     pub(crate) job_id: Option<String>,
     pub(crate) device_id: Option<String>,
     pub(crate) created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ExecutionIntent {
-    WorkspaceChange,
-    ReadOnly,
-}
-
-impl ExecutionIntent {
-    pub(crate) fn as_str(&self) -> &'static str {
-        match self {
-            Self::WorkspaceChange => "workspace_change",
-            Self::ReadOnly => "read_only",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,74 +197,15 @@ pub(crate) struct MessageDispatchResponse {
     pub(crate) job: JobRecord,
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct RegisterDeviceRequest {
-    pub(crate) name: String,
-    pub(crate) primary_flag: bool,
-    #[serde(default)]
-    pub(crate) allowed_repos: Vec<String>,
-    #[serde(default)]
-    pub(crate) allowed_repo_roots: Vec<String>,
-    #[serde(default)]
-    pub(crate) hidden_repos: Vec<String>,
-    #[serde(default)]
-    pub(crate) excluded_repo_paths: Vec<String>,
-    #[serde(default)]
-    pub(crate) discovered_repos: Vec<String>,
-    #[serde(default)]
-    pub(crate) repositories: Vec<DeviceRepository>,
-    #[serde(default)]
-    pub(crate) capabilities: Vec<String>,
-    #[serde(default)]
-    pub(crate) trust: Option<DeviceRegistrationTrustProof>,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct RegistrationChallengeResponse {
-    pub(crate) challenge_id: String,
-    pub(crate) challenge: String,
-    pub(crate) issued_at: DateTime<Utc>,
-    pub(crate) orchestrator_key_id: String,
-    pub(crate) orchestrator_public_key: String,
-    pub(crate) trusted_signers: Vec<OrchestratorTrustSigner>,
-    pub(crate) signature: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum RegistrationTrustIntent {
-    Enroll,
-    Rotate,
-    Reenroll,
-}
-
-impl Default for RegistrationTrustIntent {
-    fn default() -> Self {
-        Self::Enroll
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DeviceTrustStatus {
+    #[default]
     Untrusted,
     Trusted,
     Rotated,
     Revoked,
     AttentionRequired,
-}
-
-impl Default for DeviceTrustStatus {
-    fn default() -> Self {
-        Self::Untrusted
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct OrchestratorTrustSigner {
-    pub(crate) key_id: String,
-    pub(crate) public_key: String,
-    pub(crate) active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -359,33 +290,9 @@ impl DeviceTrustMetadata {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct DeviceRegistrationTrustProof {
-    pub(crate) orchestrator_challenge_id: String,
-    pub(crate) orchestrator_challenge: String,
-    pub(crate) orchestrator_challenge_issued_at: DateTime<Utc>,
-    pub(crate) orchestrator_key_id: String,
-    pub(crate) orchestrator_public_key: String,
-    pub(crate) orchestrator_signature: String,
-    pub(crate) edge_public_key: String,
-    pub(crate) edge_signature: String,
-    #[serde(default)]
-    pub(crate) registration_intent: RegistrationTrustIntent,
-}
-
 #[derive(Debug, Deserialize)]
 pub(crate) struct ProbeDeviceRequest {
     pub(crate) job_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct AvailabilitySnapshot {
-    pub(crate) probe_id: String,
-    pub(crate) job_id: Option<String>,
-    pub(crate) device_id: String,
-    pub(crate) available: bool,
-    pub(crate) reason: String,
-    pub(crate) responded_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -445,65 +352,6 @@ pub(crate) struct RevokeDeviceTrustRequest {
 pub(crate) struct RepositoryOption {
     pub(crate) name: String,
     pub(crate) device_count: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct DeviceRepository {
-    pub(crate) name: String,
-    #[serde(default)]
-    pub(crate) branches: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct AvailabilityProbeMessage {
-    pub(crate) probe_id: String,
-    pub(crate) job_id: Option<String>,
-    pub(crate) device_id: String,
-    pub(crate) sent_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct JobDispatchMessage {
-    pub(crate) job_id: String,
-    pub(crate) short_id: String,
-    pub(crate) correlation_id: String,
-    pub(crate) thread_id: String,
-    pub(crate) title: String,
-    pub(crate) device_id: String,
-    pub(crate) repo_name: String,
-    pub(crate) base_branch: String,
-    pub(crate) branch_name: String,
-    pub(crate) request_text: String,
-    pub(crate) execution_intent: ExecutionIntent,
-    pub(crate) dispatched_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct JobLifecycleEvent {
-    pub(crate) job_id: String,
-    pub(crate) correlation_id: String,
-    pub(crate) device_id: String,
-    pub(crate) event_type: String,
-    pub(crate) status: Option<String>,
-    pub(crate) result: Option<String>,
-    pub(crate) failure_class: Option<String>,
-    pub(crate) worktree_path: Option<String>,
-    pub(crate) detail: Option<String>,
-    pub(crate) payload_json: Option<Value>,
-    pub(crate) created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct JobApprovalCommand {
-    pub(crate) approval_id: String,
-    pub(crate) job_id: String,
-    pub(crate) short_id: String,
-    pub(crate) correlation_id: String,
-    pub(crate) device_id: String,
-    pub(crate) repo_name: String,
-    pub(crate) branch_name: String,
-    pub(crate) action_type: String,
-    pub(crate) approved_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Deserialize)]

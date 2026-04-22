@@ -62,7 +62,7 @@ pub(crate) async fn registration_challenge(
         challenge_id,
         challenge,
         issued_at,
-        orchestrator_key_id,
+        orchestrator_key_id: Some(orchestrator_key_id),
         orchestrator_public_key,
         trusted_signers: exported_orchestrator_signers(&state)?,
         signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
