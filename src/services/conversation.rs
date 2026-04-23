@@ -8,8 +8,8 @@ use crate::{
     error::AppError,
     formatting::{derive_job_title_from_message, sanitize_optional_string},
     models::{
-        ExecutionDraft, ExecutionIntent, JobRecord, MessageRecord, NoteRecord, SummaryRecord,
-        ThreadRecord,
+        ExecutionDraft, ExecutionIntent, JobRecord, JobTargetKind, MessageRecord,
+        RelatedNoteContext, SummaryRecord, ThreadRecord,
     },
     state::AppState,
 };
@@ -19,7 +19,7 @@ pub(crate) async fn generate_conversational_reply(
     thread: &ThreadRecord,
     messages: &[MessageRecord],
     jobs: &[JobRecord],
-    related_notes: &[NoteRecord],
+    related_notes: &[RelatedNoteContext],
     execution_draft: Option<&ExecutionDraft>,
 ) -> Result<String, AppError> {
     if state.assistant.api_key.is_some() {
@@ -54,7 +54,7 @@ async fn request_assistant_reply(
     thread: &ThreadRecord,
     messages: &[MessageRecord],
     jobs: &[JobRecord],
-    related_notes: &[NoteRecord],
+    related_notes: &[RelatedNoteContext],
     execution_draft: Option<&ExecutionDraft>,
 ) -> Result<String, AppError> {
     let api_key = state
@@ -116,7 +116,7 @@ async fn build_conversation_input(
     thread: &ThreadRecord,
     messages: &[MessageRecord],
     jobs: &[JobRecord],
-    related_notes: &[NoteRecord],
+    related_notes: &[RelatedNoteContext],
     execution_draft: Option<&ExecutionDraft>,
 ) -> Result<String, AppError> {
     let latest_user = messages
@@ -181,12 +181,13 @@ fn format_execution_draft_context(execution_draft: Option<&ExecutionDraft>) -> S
     };
 
     format!(
-        "- title `{}`; repo `{}`; branch `{}`; intent `{}`; request {}; rationale {}",
+        "- title `{}`; target kind `{}`; target `{}`; branch `{}`; intent `{}`; prompt {}; rationale {}",
         draft.title,
-        draft.repo_name.as_deref().unwrap_or("unspecified"),
-        draft.base_branch,
+        draft.target_kind.as_str(),
+        draft.target_name,
+        draft.base_branch.as_deref().unwrap_or("n/a"),
         draft.execution_intent.as_str(),
-        summarize_text(&draft.request_text, 220),
+        summarize_text(&draft.prompt, 220),
         summarize_text(&draft.rationale, 160),
     )
 }
@@ -228,8 +229,14 @@ fn format_job_context(job_context: &[ConversationJobContext]) -> String {
         .map(|entry| {
             let job = &entry.job;
             let mut parts = vec![format!(
-                "- [Job {}] repo `{}` is `{}`",
-                job.short_id, job.repo_name, job.status
+                "- [Job {}] {} `{}` is `{}`",
+                job.short_id,
+                match job.target_kind_enum() {
+                    JobTargetKind::Repository => "repository",
+                    JobTargetKind::Capability => "capability",
+                },
+                job.target_name(),
+                job.status
             )];
             if let Some(result) = job.result.as_deref() {
                 parts.push(format!("result `{result}`"));
@@ -252,7 +259,7 @@ fn format_job_context(job_context: &[ConversationJobContext]) -> String {
         .join("\n")
 }
 
-fn format_note_context(notes: &[NoteRecord], limit: usize) -> String {
+fn format_note_context(notes: &[RelatedNoteContext], limit: usize) -> String {
     if notes.is_empty() {
         return "- none".to_string();
     }
@@ -261,12 +268,27 @@ fn format_note_context(notes: &[NoteRecord], limit: usize) -> String {
         .iter()
         .take(limit)
         .map(|note| {
+            let excerpt = note
+                .detail_excerpt
+                .as_deref()
+                .map(|excerpt| format!(" | excerpt {}", summarize_text(excerpt, 180)))
+                .unwrap_or_default();
+            let reasons = if note.note.match_reasons.is_empty() {
+                "none".to_string()
+            } else {
+                note.note.match_reasons.join(", ")
+            };
             format!(
-                "- [Note {}] kind `{}` updated `{}`: {}",
-                note.title,
-                note.source_kind.as_deref().unwrap_or("general"),
-                note.updated_at.to_rfc3339(),
-                summarize_text(&note.summary, 200)
+                "- [Note {}] role `{}` source `{}` kind `{}` score `{:.0}` reasons [{}] updated `{}`: {}{}",
+                note.note.title,
+                note.memory_role,
+                note.source_label,
+                note.note.source_kind.as_deref().unwrap_or("general"),
+                note.note.relevance_score,
+                reasons,
+                note.note.updated_at.to_rfc3339(),
+                summarize_text(&note.note.summary, 200),
+                excerpt,
             )
         })
         .collect::<Vec<_>>()
@@ -274,7 +296,13 @@ fn format_note_context(notes: &[NoteRecord], limit: usize) -> String {
 }
 
 fn format_message_mode_label(message: &MessageRecord) -> &'static str {
-    if message.status == "conversation.reply" && message_execution_draft(message).is_some() {
+    if message.status == "conversation.reply"
+        && message_execution_draft(message)
+            .map(|draft| matches!(draft.target_kind, JobTargetKind::Capability))
+            .unwrap_or(false)
+    {
+        "conversation-capability-draft"
+    } else if message.status == "conversation.reply" && message_execution_draft(message).is_some() {
         "conversation-draft"
     } else if message.status == "conversation.reply" {
         "conversation"
@@ -340,7 +368,7 @@ fn build_fallback_conversational_reply(
     thread: &ThreadRecord,
     messages: &[MessageRecord],
     jobs: &[JobRecord],
-    related_notes: &[NoteRecord],
+    related_notes: &[RelatedNoteContext],
     execution_draft: Option<&ExecutionDraft>,
 ) -> String {
     let latest_user = messages
@@ -352,42 +380,58 @@ fn build_fallback_conversational_reply(
     let latest_job = jobs.first();
 
     if looks_like_execution_request(latest_user) {
-        let repo_hint = latest_job
+        let target_hint = latest_job
             .map(|job| {
                 format!(
-                    " The most recent job in this thread targeted repo `{}`.",
-                    job.repo_name
+                    " The most recent job in this thread targeted {} `{}`.",
+                    match job.target_kind_enum() {
+                        JobTargetKind::Repository => "repository",
+                        JobTargetKind::Capability => "capability",
+                    },
+                    job.target_name()
                 )
             })
             .unwrap_or_default();
         if let Some(draft) = execution_draft {
-            return format!(
-                "I'm still in conversational mode for thread `{}`. I prepared a draft for repo `{}` on base branch `{}` below so you can refine it before you dispatch anything.{}",
-                thread.title,
-                draft.repo_name.as_deref().unwrap_or("unspecified"),
-                draft.base_branch,
-                repo_hint
-            );
+            return match draft.target_kind {
+                JobTargetKind::Repository => format!(
+                    "I'm still in conversational mode for thread `{}`. I prepared a prompt-first draft for repository `{}` on base branch `{}` below so you can refine it before you dispatch anything.{}",
+                    thread.title,
+                    draft.target_name,
+                    draft.base_branch.as_deref().unwrap_or("main"),
+                    target_hint
+                ),
+                JobTargetKind::Capability => format!(
+                    "I'm still in conversational mode for thread `{}`. I prepared a capability-targeted prompt draft for `{}` below so you can refine it before you dispatch anything.{}",
+                    thread.title, draft.target_name, target_hint
+                ),
+            };
         }
         return format!(
             "I'm in conversational mode for thread `{}` right now, so I have not created a laptop job yet. I can help refine the request or you can use the explicit dispatch controls when you're ready.{}",
-            thread.title, repo_hint
+            thread.title, target_hint
         );
     }
 
     if let Some(draft) = execution_draft {
-        return format!(
-            "I'm still in conversational mode, and I prepared an execution draft for repo `{}` on base branch `{}` from the latest request. You can keep refining it here before explicitly dispatching it.",
-            draft.repo_name.as_deref().unwrap_or("unspecified"),
-            draft.base_branch
-        );
+        return match draft.target_kind {
+            JobTargetKind::Repository => format!(
+                "I'm still in conversational mode, and I prepared an execution draft for repository `{}` on base branch `{}` from the latest request. You can keep refining the prompt here before explicitly dispatching it.",
+                draft.target_name,
+                draft.base_branch.as_deref().unwrap_or("main")
+            ),
+            JobTargetKind::Capability => format!(
+                "I'm still in conversational mode, and I prepared a capability-targeted draft for `{}` from the latest request. You can keep refining the prompt here before explicitly dispatching it.",
+                draft.target_name
+            ),
+        };
     }
 
     if let Some(job) = latest_job {
         return format!(
             "I'm here in conversational mode. The latest job in this thread is `{}` for repo `{}`, currently `{}`{}.\n\nI can help you reason about the next step, summarize what happened, or prepare an explicit handoff into laptop execution when you want it.",
             job.short_id,
-            job.repo_name,
+            job.target_name(),
             job.status,
             job.result
                 .as_deref()
@@ -399,8 +443,8 @@ fn build_fallback_conversational_reply(
     if let Some(note) = related_notes.first() {
         return format!(
             "I'm here in conversational mode. I can answer questions about this thread, help plan work, or prepare an explicit laptop dispatch when needed.\n\nThe closest related note I found is `{}`: {}",
-            note.title,
-            summarize_text(&note.summary, 160)
+            note.note.title,
+            summarize_text(&note.note.summary, 160)
         );
     }
 
@@ -421,6 +465,28 @@ pub(crate) fn looks_like_execution_request(value: &str) -> bool {
         "send to laptop",
         "review the code",
         "write code",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn looks_like_capability_request(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    [
+        "calendar",
+        "meeting",
+        "availability",
+        "schedule",
+        "email",
+        "gmail",
+        "inbox",
+        "drive",
+        "document",
+        "docs",
+        "sheet",
+        "service",
+        "tool",
+        "llm workload",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
@@ -514,7 +580,9 @@ pub(crate) fn maybe_build_execution_draft(
     let latest_text = latest_user.content.trim();
     let previous_draft = messages.iter().rev().find_map(message_execution_draft);
     let request_is_execution = looks_like_execution_request(latest_text);
+    let request_is_capability = looks_like_capability_request(latest_text);
     let should_draft = request_is_execution
+        || request_is_capability
         || (previous_draft.is_some() && looks_like_draft_refinement(latest_text));
     if !should_draft {
         return None;
@@ -525,35 +593,59 @@ pub(crate) fn maybe_build_execution_draft(
     } else {
         DraftRefinement::default()
     };
-    let request_text = if request_is_execution {
+    let prompt = if request_is_execution {
         latest_text.to_string()
     } else if let Some(previous_draft) = previous_draft.as_ref() {
         merge_request_text(
-            previous_draft.request_text.trim(),
+            previous_draft.prompt.trim(),
             refinement.request_update.as_deref(),
         )
     } else {
         latest_text.to_string()
     };
-    let repo_name = refinement
-        .repo_name
-        .or_else(|| extract_repo_hint(latest_text))
-        .or_else(|| {
-            previous_draft
-                .as_ref()
-                .and_then(|draft| draft.repo_name.clone())
-        })
-        .or_else(|| jobs.first().map(|job| job.repo_name.clone()));
-    let base_branch = refinement
-        .base_branch
-        .or_else(|| extract_base_branch_hint(latest_text))
-        .or_else(|| {
-            previous_draft
-                .as_ref()
-                .map(|draft| draft.base_branch.clone())
-        })
-        .or_else(|| jobs.first().and_then(|job| job.base_branch.clone()))
-        .unwrap_or_else(|| "main".to_string());
+    let target_kind = if request_is_capability
+        || previous_draft
+            .as_ref()
+            .map(|draft| matches!(draft.target_kind, JobTargetKind::Capability))
+            .unwrap_or(false)
+    {
+        JobTargetKind::Capability
+    } else {
+        JobTargetKind::Repository
+    };
+    let target_name = if matches!(target_kind, JobTargetKind::Repository) {
+        refinement
+            .repo_name
+            .or_else(|| extract_repo_hint(latest_text))
+            .or_else(|| {
+                previous_draft
+                    .as_ref()
+                    .map(|draft| draft.target_name.clone())
+            })
+            .or_else(|| jobs.first().and_then(|job| job.repo_name.clone()))
+            .unwrap_or_else(|| "unspecified".to_string())
+    } else {
+        previous_draft
+            .as_ref()
+            .map(|draft| draft.target_name.clone())
+            .unwrap_or_else(|| "generic_jobs".to_string())
+    };
+    let base_branch = if matches!(target_kind, JobTargetKind::Repository) {
+        Some(
+            refinement
+                .base_branch
+                .or_else(|| extract_base_branch_hint(latest_text))
+                .or_else(|| {
+                    previous_draft
+                        .as_ref()
+                        .and_then(|draft| draft.base_branch.clone())
+                })
+                .or_else(|| jobs.first().and_then(|job| job.base_branch.clone()))
+                .unwrap_or_else(|| "main".to_string()),
+        )
+    } else {
+        None
+    };
     let execution_intent = if request_is_execution {
         infer_execution_intent(latest_text)
     } else if let Some(intent_override) = extract_execution_intent_override(latest_text) {
@@ -567,23 +659,25 @@ pub(crate) fn maybe_build_execution_draft(
     let title = if let Some(title) = refinement.title {
         title
     } else if request_is_execution {
-        derive_job_title_from_message(&request_text)
+        derive_job_title_from_message(&prompt)
     } else if let Some(request_update) = refinement.request_update.as_deref() {
         derive_job_title_from_message(request_update)
     } else {
         let request_changed = previous_draft
             .as_ref()
-            .map(|draft| draft.request_text.trim() != request_text.trim())
+            .map(|draft| draft.prompt.trim() != prompt.trim())
             .unwrap_or(true);
         previous_draft
             .as_ref()
             .filter(|_| !request_changed)
             .map(|draft| draft.title.clone())
-            .unwrap_or_else(|| derive_job_title_from_message(&request_text))
+            .unwrap_or_else(|| derive_job_title_from_message(&prompt))
     };
     let rationale = if previous_draft.is_some() && looks_like_draft_refinement(latest_text) {
         "Updated the draft using the latest conversational refinement without dispatching a job."
             .to_string()
+    } else if matches!(target_kind, JobTargetKind::Capability) {
+        "Prepared as a generic capability-targeted job so the edge can execute the request without requiring a repository worktree.".to_string()
     } else if matches!(execution_intent, ExecutionIntent::ReadOnly) {
         "Prepared as a read-only repository investigation so the laptop can inspect and report without creating durable repo changes.".to_string()
     } else {
@@ -592,9 +686,10 @@ pub(crate) fn maybe_build_execution_draft(
 
     Some(ExecutionDraft {
         title,
-        repo_name,
+        target_kind,
+        target_name,
         base_branch,
-        request_text,
+        prompt,
         execution_intent,
         source_message_id: latest_user.id.clone(),
         source_role: latest_user.role.clone(),
@@ -846,7 +941,7 @@ mod tests {
         DraftRefinement, extract_refinement_request_update, extract_title_hint,
         maybe_annotate_draft_reply, maybe_build_execution_draft, parse_draft_refinement,
     };
-    use crate::models::{ExecutionDraft, ExecutionIntent, JobRecord, MessageRecord};
+    use crate::models::{ExecutionDraft, ExecutionIntent, JobRecord, JobTargetKind, MessageRecord};
     use chrono::Utc;
     use serde_json::json;
 
@@ -881,10 +976,10 @@ mod tests {
     fn previous_draft() -> ExecutionDraft {
         ExecutionDraft {
             title: "Polish chat shell".to_string(),
-            repo_name: Some("elowen-ui".to_string()),
-            base_branch: "main".to_string(),
-            request_text: "Tighten the chat shell spacing and improve result presentation."
-                .to_string(),
+            target_kind: JobTargetKind::Repository,
+            target_name: "elowen-ui".to_string(),
+            base_branch: Some("main".to_string()),
+            prompt: "Tighten the chat shell spacing and improve result presentation.".to_string(),
             execution_intent: ExecutionIntent::WorkspaceChange,
             source_message_id: "u1".to_string(),
             source_role: "user".to_string(),
@@ -901,10 +996,12 @@ mod tests {
             correlation_id: "corr-1".to_string(),
             thread_id: "thread-1".to_string(),
             title: "Existing".to_string(),
+            target_kind: "repository".to_string(),
             status: "completed".to_string(),
             result: Some("success".to_string()),
             failure_class: None,
-            repo_name: "elowen-api".to_string(),
+            repo_name: Some("elowen-api".to_string()),
+            capability_name: None,
             device_id: Some("edge-1".to_string()),
             branch_name: Some("codex/job-1-existing".to_string()),
             base_branch: Some("main".to_string()),
@@ -947,11 +1044,11 @@ mod tests {
 
         let next_draft = maybe_build_execution_draft(&messages, &[sample_job()]).unwrap();
 
-        assert_eq!(next_draft.repo_name.as_deref(), Some("elowen-api"));
-        assert_eq!(next_draft.base_branch, "release/2026");
+        assert_eq!(next_draft.target_name, "elowen-api");
+        assert_eq!(next_draft.base_branch.as_deref(), Some("release/2026"));
         assert_eq!(next_draft.title, "API transcript polish");
         assert_eq!(
-            next_draft.request_text,
+            next_draft.prompt,
             "Tighten the chat shell spacing and improve result presentation."
         );
     }
@@ -974,7 +1071,7 @@ mod tests {
         let next_draft = maybe_build_execution_draft(&messages, &[sample_job()]).unwrap();
 
         assert_eq!(
-            next_draft.request_text,
+            next_draft.prompt,
             "Tighten the chat shell spacing and improve result presentation.\n\nAdditional instruction: add local timestamp formatting in the thread transcript"
         );
         assert_eq!(

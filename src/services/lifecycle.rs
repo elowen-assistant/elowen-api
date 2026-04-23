@@ -267,8 +267,14 @@ async fn build_thread_assistant_reply(
         "job.started" => Some((
             format!("job_event:{}:started", event.job_id),
             format!(
-                "I started working on job `{}` for repo `{}` on device `{}`.",
-                job.short_id, job.repo_name, event.device_id
+                "I started working on job `{}` for {} `{}` on device `{}`.",
+                job.short_id,
+                match job.target_kind_enum() {
+                    crate::models::JobTargetKind::Repository => "repository",
+                    crate::models::JobTargetKind::Capability => "capability",
+                },
+                job.target_name(),
+                event.device_id
             ),
             json!({}),
         )),

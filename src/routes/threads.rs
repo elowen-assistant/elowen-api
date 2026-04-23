@@ -21,7 +21,8 @@ use crate::{
     models::{
         ChatDispatchResponse, ChatReplyResponse, CreateChatDispatchRequest, CreateJobRequest,
         CreateMessageRequest, CreateThreadChatRequest, CreateThreadRequest,
-        DispatchThreadMessageRequest, MessageDispatchResponse, ThreadDetail, ThreadSummary,
+        DispatchThreadMessageRequest, JobTargetKind, MessageDispatchResponse, ThreadDetail,
+        ThreadSummary,
     },
     services::{
         conversation::{
@@ -30,7 +31,7 @@ use crate::{
             summarize_text,
         },
         jobs::{create_job_record, load_job_detail_from_record},
-        notes::load_related_thread_notes,
+        notes::{load_related_thread_note_context, load_related_thread_notes},
         ui_events::{job_ui_event, publish_ui_event, thread_ui_event},
     },
     state::AppState,
@@ -129,14 +130,15 @@ pub(crate) async fn create_thread_chat(
     let thread = load_thread_record(&state.pool, &thread_id).await?;
     let messages = load_thread_messages(&state.pool, &thread_id).await?;
     let jobs = load_thread_jobs(&state.pool, &thread_id).await?;
-    let related_notes = load_related_thread_notes(&state, &thread, &messages, &jobs).await?;
+    let related_note_context =
+        load_related_thread_note_context(&state, &thread, &messages, &jobs).await?;
     let execution_draft = maybe_build_execution_draft(&messages, &jobs);
     let assistant_reply = generate_conversational_reply(
         &state,
         &thread,
         &messages,
         &jobs,
-        &related_notes,
+        &related_note_context,
         execution_draft.as_ref(),
     )
     .await?;
@@ -179,14 +181,10 @@ pub(crate) async fn dispatch_thread_message(
     }
 
     let embedded_draft = message_execution_draft(&source_message);
-    let request_text = sanitize_optional_string(request.request_text.clone())
-        .or_else(|| {
-            embedded_draft
-                .as_ref()
-                .map(|draft| draft.request_text.clone())
-        })
+    let prompt = sanitize_optional_string(request.prompt.clone())
+        .or_else(|| embedded_draft.as_ref().map(|draft| draft.prompt.clone()))
         .unwrap_or_else(|| source_message.content.trim().to_string());
-    if request_text.is_empty() {
+    if prompt.is_empty() {
         return Err(AppError::bad_request(anyhow::anyhow!(
             "source message content is required"
         )));
@@ -194,21 +192,27 @@ pub(crate) async fn dispatch_thread_message(
 
     let title = sanitize_optional_string(request.title)
         .or_else(|| embedded_draft.as_ref().map(|draft| draft.title.clone()))
-        .unwrap_or_else(|| derive_job_title_from_message(&request_text));
-    let repo_name = sanitize_optional_string(Some(request.repo_name.clone()))
-        .or_else(|| {
-            embedded_draft
-                .as_ref()
-                .and_then(|draft| draft.repo_name.clone())
-        })
-        .ok_or_else(|| AppError::bad_request(anyhow::anyhow!("repo name is required")))?;
-    let base_branch = sanitize_optional_string(request.base_branch)
-        .or_else(|| {
-            embedded_draft
-                .as_ref()
-                .map(|draft| draft.base_branch.clone())
-        })
-        .unwrap_or_else(|| "main".to_string());
+        .unwrap_or_else(|| derive_job_title_from_message(&prompt));
+    let target_kind = if matches!(request.target_kind, JobTargetKind::Repository)
+        && request.target_name.is_none()
+    {
+        embedded_draft
+            .as_ref()
+            .map(|draft| draft.target_kind.clone())
+            .unwrap_or(JobTargetKind::Repository)
+    } else {
+        request.target_kind.clone()
+    };
+    let target_name = sanitize_optional_string(request.target_name.clone()).or_else(|| {
+        embedded_draft
+            .as_ref()
+            .map(|draft| draft.target_name.clone())
+    });
+    let base_branch = sanitize_optional_string(request.base_branch).or_else(|| {
+        embedded_draft
+            .as_ref()
+            .and_then(|draft| draft.base_branch.clone())
+    });
     let execution_intent = request
         .execution_intent
         .or_else(|| {
@@ -216,16 +220,17 @@ pub(crate) async fn dispatch_thread_message(
                 .as_ref()
                 .map(|draft| draft.execution_intent.clone())
         })
-        .unwrap_or_else(|| infer_execution_intent(&request_text));
+        .unwrap_or_else(|| infer_execution_intent(&prompt));
 
     let job = create_job_record(
         &state,
         &thread_id,
         &CreateJobRequest {
             title,
-            repo_name: repo_name.clone(),
-            base_branch: Some(base_branch),
-            request_text: request_text.clone(),
+            target_kind: target_kind.clone(),
+            target_name: target_name.clone(),
+            base_branch,
+            prompt: prompt.clone(),
             device_id: request.device_id,
             execution_intent: Some(execution_intent.clone()),
         },
@@ -236,13 +241,17 @@ pub(crate) async fn dispatch_thread_message(
         &thread_id,
         "system",
         &format!(
-            "Escalated {} message `{}` into job `{}` for repo `{}` in {} mode.\nRequest summary: {}",
+            "Escalated {} message `{}` into job `{}` for {} `{}` in {} mode.\nRequest summary: {}",
             source_message.role,
             source_message.id,
             job.short_id,
-            job.repo_name,
+            match job.target_kind_enum() {
+                JobTargetKind::Repository => "repository",
+                JobTargetKind::Capability => "capability",
+            },
+            job.target_name(),
             execution_intent_note(&execution_intent),
-            summarize_text(&request_text, 160)
+            summarize_text(&prompt, 160)
         ),
         "workflow.handoff.created",
     )
@@ -278,17 +287,8 @@ pub(crate) async fn create_chat_dispatch(
         )));
     }
 
-    let repo_name = request.repo_name.trim();
-    if repo_name.is_empty() {
-        return Err(AppError::bad_request(anyhow::anyhow!(
-            "repo name is required"
-        )));
-    }
-
     let title = sanitize_optional_string(request.title)
         .unwrap_or_else(|| derive_job_title_from_message(content));
-    let base_branch =
-        sanitize_optional_string(request.base_branch).unwrap_or_else(|| "main".to_string());
     let execution_intent = request
         .execution_intent
         .unwrap_or_else(|| infer_execution_intent(content));
@@ -299,9 +299,10 @@ pub(crate) async fn create_chat_dispatch(
         &thread_id,
         &CreateJobRequest {
             title,
-            repo_name: repo_name.to_string(),
-            base_branch: Some(base_branch),
-            request_text: content.to_string(),
+            target_kind: request.target_kind,
+            target_name: sanitize_optional_string(request.target_name),
+            base_branch: sanitize_optional_string(request.base_branch),
+            prompt: content.to_string(),
             device_id: request.device_id,
             execution_intent: Some(execution_intent.clone()),
         },
@@ -312,13 +313,17 @@ pub(crate) async fn create_chat_dispatch(
         &thread_id,
         "system",
         &format!(
-            "Created job `{}` with status `{}` on device `{}` for repo `{}` in {} mode.",
+            "Created job `{}` with status `{}` on device `{}` for {} `{}` in {} mode.",
             job.short_id,
             job.status,
             job.device_id
                 .clone()
                 .unwrap_or_else(|| "unassigned".to_string()),
-            job.repo_name,
+            match job.target_kind_enum() {
+                JobTargetKind::Repository => "repository",
+                JobTargetKind::Capability => "capability",
+            },
+            job.target_name(),
             execution_intent_note(&execution_intent),
         ),
         "workflow.dispatch.created",
