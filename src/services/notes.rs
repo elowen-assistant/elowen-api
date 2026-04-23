@@ -482,13 +482,13 @@ fn build_thread_notes_context(
     terms.extend(
         jobs.iter()
             .take(2)
-            .map(|job| format!("{} {}", job.title, job.repo_name)),
+            .map(|job| format!("{} {}", job.title, job.target_name())),
     );
     join_terms(terms)
 }
 
 fn build_job_notes_query(job: &JobRecord, summary: Option<&SummaryRecord>) -> Option<String> {
-    let mut terms = vec![job.title.clone(), job.repo_name.clone()];
+    let mut terms = vec![job.title.clone(), job.target_name().to_string()];
     if let Some(summary) = summary {
         terms.push(super::conversation::summarize_text(&summary.content, 180));
     }
@@ -496,7 +496,7 @@ fn build_job_notes_query(job: &JobRecord, summary: Option<&SummaryRecord>) -> Op
 }
 
 fn build_job_notes_context(job: &JobRecord, summary: Option<&SummaryRecord>) -> Option<String> {
-    let mut terms = vec![job.title.clone(), job.repo_name.clone()];
+    let mut terms = vec![job.title.clone(), job.target_name().to_string()];
     if let Some(branch_name) = job.branch_name.as_deref() {
         terms.push(branch_name.to_string());
     }
@@ -571,10 +571,12 @@ mod tests {
             correlation_id: "corr-1".to_string(),
             thread_id: "thread-1".to_string(),
             title: title.to_string(),
+            target_kind: "repository".to_string(),
             status: "completed".to_string(),
             result: Some("success".to_string()),
             failure_class: None,
-            repo_name: repo_name.to_string(),
+            repo_name: Some(repo_name.to_string()),
+            capability_name: None,
             device_id: None,
             branch_name: Some("main".to_string()),
             base_branch: Some("main".to_string()),

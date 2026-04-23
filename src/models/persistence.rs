@@ -5,7 +5,7 @@ use serde::Serialize;
 use serde_json::Value;
 use sqlx::{FromRow, types::Json as SqlxJson};
 
-use super::transport::{DeviceMetadata, DeviceRecord, JobEventRecord};
+use super::transport::{DeviceMetadata, DeviceRecord, JobEventRecord, JobTargetKind};
 
 #[derive(Debug, Serialize, FromRow)]
 pub(crate) struct ThreadSummary {
@@ -47,10 +47,12 @@ pub(crate) struct JobRecord {
     pub(crate) correlation_id: String,
     pub(crate) thread_id: String,
     pub(crate) title: String,
+    pub(crate) target_kind: String,
     pub(crate) status: String,
     pub(crate) result: Option<String>,
     pub(crate) failure_class: Option<String>,
-    pub(crate) repo_name: String,
+    pub(crate) repo_name: Option<String>,
+    pub(crate) capability_name: Option<String>,
     pub(crate) device_id: Option<String>,
     pub(crate) branch_name: Option<String>,
     pub(crate) base_branch: Option<String>,
@@ -149,6 +151,22 @@ impl From<DeviceRow> for DeviceRecord {
             trust,
             created_at: row.created_at,
             updated_at: row.updated_at,
+        }
+    }
+}
+
+impl JobRecord {
+    pub(crate) fn target_kind_enum(&self) -> JobTargetKind {
+        match self.target_kind.as_str() {
+            "capability" => JobTargetKind::Capability,
+            _ => JobTargetKind::Repository,
+        }
+    }
+
+    pub(crate) fn target_name(&self) -> &str {
+        match self.target_kind_enum() {
+            JobTargetKind::Repository => self.repo_name.as_deref().unwrap_or("unspecified"),
+            JobTargetKind::Capability => self.capability_name.as_deref().unwrap_or("unspecified"),
         }
     }
 }

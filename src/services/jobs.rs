@@ -16,7 +16,7 @@ use crate::{
     formatting::{sanitize_optional_string, slugify},
     models::{
         ApprovalRecord, CreateJobRequest, DeviceRepository, JobApprovalCommand, JobDetail,
-        JobDispatchMessage, JobRecord,
+        JobDispatchMessage, JobRecord, JobTargetKind,
     },
     services::notes::load_related_job_notes,
     state::AppState,
@@ -30,31 +30,42 @@ pub(crate) async fn create_job_record(
     request: &CreateJobRequest,
 ) -> Result<JobRecord, AppError> {
     let title = request.title.trim();
-    let repo_name = request.repo_name.trim();
-    let request_text = request.request_text.trim();
-    let base_branch =
-        sanitize_optional_string(request.base_branch.clone()).unwrap_or_else(|| "main".to_string());
+    let prompt = request.prompt.trim();
+    let target_kind = request.target_kind.clone();
+    let target_name = sanitize_optional_string(request.target_name.clone());
+    let base_branch = sanitize_optional_string(request.base_branch.clone());
     let execution_intent = request
         .execution_intent
         .clone()
-        .unwrap_or_else(|| infer_execution_intent(request_text));
+        .unwrap_or_else(|| infer_execution_intent(prompt));
 
     if title.is_empty() {
         return Err(AppError::bad_request(anyhow!("job title is required")));
     }
 
-    if repo_name.is_empty() {
-        return Err(AppError::bad_request(anyhow!("repo name is required")));
+    if prompt.is_empty() {
+        return Err(AppError::bad_request(anyhow!("job prompt is required")));
     }
 
-    if request_text.is_empty() {
-        return Err(AppError::bad_request(anyhow!(
-            "job request text is required"
-        )));
-    }
+    let target_name = target_name
+        .clone()
+        .ok_or_else(|| AppError::bad_request(anyhow!("target name is required")))?;
+    let (repo_name, capability_name) = match &target_kind {
+        JobTargetKind::Repository => (Some(target_name.clone()), None),
+        JobTargetKind::Capability => (None, Some(target_name.clone())),
+    };
+    let base_branch = match &target_kind {
+        JobTargetKind::Repository => Some(base_branch.unwrap_or_else(|| "main".to_string())),
+        JobTargetKind::Capability => None,
+    };
 
-    let target_device =
-        select_dispatch_device(&state.pool, request.device_id.as_deref(), repo_name).await?;
+    let target_device = select_dispatch_device(
+        &state.pool,
+        request.device_id.as_deref(),
+        &target_kind,
+        &target_name,
+    )
+    .await?;
     let target_device_id = target_device.id.clone();
     let job_id = Ulid::new().to_string();
     let correlation_id = Ulid::new().to_string();
@@ -63,7 +74,10 @@ pub(crate) async fn create_job_record(
         .take(8)
         .collect::<String>()
         .to_ascii_lowercase();
-    let branch_name = format!("codex/{}-{}", short_id, slugify(title));
+    let branch_name = match &target_kind {
+        JobTargetKind::Repository => Some(format!("codex/{}-{}", short_id, slugify(title))),
+        JobTargetKind::Capability => None,
+    };
 
     let _job = sqlx::query_as::<_, JobRecord>(
         r#"
@@ -73,23 +87,27 @@ pub(crate) async fn create_job_record(
             correlation_id,
             title,
             thread_id,
+            target_kind,
             status,
             repo_name,
+            capability_name,
             device_id,
             branch_name,
             base_branch
         )
-        values ($1, $2, $3, $4, $5, 'probing', $6, $7, $8, $9)
+        values ($1, $2, $3, $4, $5, $6, 'probing', $7, $8, $9, $10, $11)
         returning
             id,
             short_id,
             correlation_id,
             thread_id,
             title,
+            target_kind,
             status,
             result,
             failure_class,
             repo_name,
+            capability_name,
             device_id,
             branch_name,
             base_branch,
@@ -104,7 +122,9 @@ pub(crate) async fn create_job_record(
     .bind(&correlation_id)
     .bind(title)
     .bind(thread_id)
-    .bind(repo_name)
+    .bind(target_kind.as_str())
+    .bind(&repo_name)
+    .bind(&capability_name)
     .bind(&target_device_id)
     .bind(&branch_name)
     .bind(&base_branch)
@@ -118,8 +138,11 @@ pub(crate) async fn create_job_record(
         "job.created",
         json!({
             "correlation_id": correlation_id.clone(),
-            "request_text": request_text,
+            "target_kind": target_kind,
+            "target_name": target_name,
+            "prompt": prompt,
             "repo_name": repo_name,
+            "capability_name": capability_name,
             "device_id": target_device_id,
             "base_branch": base_branch.clone(),
             "branch_name": branch_name.clone(),
@@ -184,10 +207,11 @@ pub(crate) async fn create_job_record(
         thread_id: thread_id.to_string(),
         title: title.to_string(),
         device_id: target_device.id.clone(),
-        repo_name: repo_name.to_string(),
+        target_kind: target_kind.clone(),
+        target_name: target_name.clone(),
         base_branch: base_branch.clone(),
         branch_name: branch_name.clone(),
-        request_text: request_text.to_string(),
+        prompt: prompt.to_string(),
         execution_intent: execution_intent.clone(),
         dispatched_at: Utc::now(),
     };
@@ -234,7 +258,10 @@ pub(crate) async fn create_job_record(
             "correlation_id": correlation_id.clone(),
             "subject": dispatch_subject,
             "device_id": target_device.id.clone(),
+            "target_kind": target_kind,
+            "target_name": target_name,
             "repo_name": repo_name,
+            "capability_name": capability_name,
             "base_branch": base_branch.clone(),
             "branch_name": branch_name.clone(),
             "execution_intent": execution_intent,
@@ -265,47 +292,71 @@ pub(crate) async fn load_job_detail_from_record(
 pub(crate) async fn select_dispatch_device(
     pool: &sqlx::PgPool,
     requested_device_id: Option<&str>,
-    repo_name: &str,
+    target_kind: &JobTargetKind,
+    target_name: &str,
 ) -> Result<crate::models::DeviceRecord, AppError> {
     if let Some(device_id) =
         requested_device_id.and_then(|value| sanitize_optional_string(Some(value.to_string())))
     {
         let device: crate::models::DeviceRecord = load_device_row(pool, &device_id).await?.into();
-        ensure_repo_allowed(&device, repo_name)?;
+        ensure_target_allowed(&device, target_kind, target_name)?;
         return Ok(device);
     }
 
     let devices = list_devices(pool).await?;
 
     for record in devices {
-        if ensure_repo_allowed(&record, repo_name).is_ok() {
+        if ensure_target_allowed(&record, target_kind, target_name).is_ok() {
             return Ok(record);
         }
     }
 
+    let detail = match target_kind {
+        JobTargetKind::Repository => "repository",
+        JobTargetKind::Capability => "capability",
+    };
     Err(AppError::conflict(anyhow!(
-        "no registered device is eligible for the requested repository"
+        "no registered device is eligible for the requested {detail}"
     )))
 }
 
-fn ensure_repo_allowed(
+fn ensure_target_allowed(
     device: &crate::models::DeviceRecord,
-    repo_name: &str,
+    target_kind: &JobTargetKind,
+    target_name: &str,
 ) -> Result<(), AppError> {
-    if !device_has_repo_scope(device) {
-        return Ok(());
-    }
+    match target_kind {
+        JobTargetKind::Repository => {
+            if !device_has_repo_scope(device) {
+                return Ok(());
+            }
 
-    if selectable_repo_names(device)
-        .iter()
-        .any(|repo| repo == repo_name)
-    {
-        return Ok(());
-    }
+            if selectable_repo_names(device)
+                .iter()
+                .any(|repo| repo == target_name)
+            {
+                return Ok(());
+            }
 
-    Err(AppError::bad_request(anyhow!(
-        "device is not allowed to run the requested repository"
-    )))
+            Err(AppError::bad_request(anyhow!(
+                "device is not allowed to run the requested repository"
+            )))
+        }
+        JobTargetKind::Capability => {
+            if device
+                .capabilities
+                .iter()
+                .map(|capability| capability.trim())
+                .any(|capability| capability == target_name)
+            {
+                return Ok(());
+            }
+
+            Err(AppError::bad_request(anyhow!(
+                "device does not advertise the requested capability"
+            )))
+        }
+    }
 }
 
 fn device_has_repo_scope(device: &crate::models::DeviceRecord) -> bool {
@@ -387,14 +438,20 @@ pub(crate) async fn publish_push_approval_command(
         .branch_name
         .as_deref()
         .ok_or_else(|| AppError::conflict(anyhow!("job branch is missing")))?;
+    if !matches!(job.target_kind_enum(), JobTargetKind::Repository) {
+        return Err(AppError::conflict(anyhow!(
+            "push approval is only available for repository jobs"
+        )));
+    }
     let command = JobApprovalCommand {
         approval_id: approval.id.clone(),
         job_id: job.id.clone(),
         short_id: job.short_id.clone(),
         correlation_id: job.correlation_id.clone(),
         device_id: device_id.to_string(),
-        repo_name: job.repo_name.clone(),
-        branch_name: branch_name.to_string(),
+        target_kind: job.target_kind_enum(),
+        target_name: job.repo_name.clone(),
+        branch_name: Some(branch_name.to_string()),
         action_type: approval.action_type.clone(),
         approved_at: Utc::now(),
     };

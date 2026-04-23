@@ -2,7 +2,14 @@
 
 use serde_json::Value;
 
-use crate::models::{ExecutionIntent, JobRecord, SummaryRecord};
+use crate::models::{ExecutionIntent, JobRecord, JobTargetKind, SummaryRecord};
+
+pub(crate) fn job_target_label(job: &JobRecord) -> String {
+    match job.target_kind_enum() {
+        JobTargetKind::Repository => format!("repo `{}`", job.target_name()),
+        JobTargetKind::Capability => format!("capability `{}`", job.target_name()),
+    }
+}
 
 pub(crate) fn execution_report_status<'a>(report: &'a Value, key: &str) -> Option<&'a str> {
     report.get(key)?.get("status")?.as_str()
@@ -46,8 +53,9 @@ pub(crate) fn format_success_reply(
     approval_summary: &str,
 ) -> String {
     let mut lines = vec![format!(
-        "I finished job `{}` for repo `{}` successfully.",
-        job.short_id, job.repo_name
+        "I finished job `{}` for {} successfully.",
+        job.short_id,
+        job_target_label(job)
     )];
 
     if let Some(branch_name) = &job.branch_name {
@@ -81,8 +89,9 @@ pub(crate) fn format_success_without_push_reply(
     last_message: Option<&str>,
 ) -> String {
     let mut lines = vec![format!(
-        "I finished job `{}` for repo `{}` successfully.",
-        job.short_id, job.repo_name
+        "I finished job `{}` for {} successfully.",
+        job.short_id,
+        job_target_label(job)
     )];
 
     if let Some(branch_name) = &job.branch_name {
@@ -119,8 +128,9 @@ pub(crate) fn format_read_only_success_reply(
     last_message: Option<&str>,
 ) -> String {
     let mut lines = vec![format!(
-        "I finished read-only job `{}` for repo `{}` successfully.",
-        job.short_id, job.repo_name
+        "I finished read-only job `{}` for {} successfully.",
+        job.short_id,
+        job_target_label(job)
     )];
 
     if let Some(branch_name) = &job.branch_name {
@@ -144,7 +154,7 @@ pub(crate) fn format_read_only_success_reply(
     lines.push(String::new());
     match changed_entries.unwrap_or(0) {
         0 => lines.push(
-            "This ran in read-only mode, so no repository changes were produced and no push approval was required."
+            "This ran in read-only mode, so no durable repository changes were produced and no push approval was required."
                 .to_string(),
         ),
         _ => lines.push(
@@ -172,8 +182,9 @@ pub(crate) fn format_failure_reply(
     summary: Option<&SummaryRecord>,
 ) -> String {
     let mut lines = vec![format!(
-        "I couldn't complete job `{}` for repo `{}`.",
-        job.short_id, job.repo_name
+        "I couldn't complete job `{}` for {}.",
+        job.short_id,
+        job_target_label(job)
     )];
 
     if let Some(branch_name) = &job.branch_name {
