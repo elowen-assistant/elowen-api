@@ -291,6 +291,41 @@ pub(crate) struct DeviceTrustMetadata {
     pub(crate) requires_attention: bool,
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct DeviceTrustEventRecord {
+    pub(crate) id: String,
+    pub(crate) device_id: String,
+    pub(crate) event_type: String,
+    pub(crate) actor_username: Option<String>,
+    pub(crate) actor_display_name: Option<String>,
+    pub(crate) actor_role: Option<String>,
+    pub(crate) reason: Option<String>,
+    pub(crate) previous_status: Option<String>,
+    pub(crate) next_status: Option<String>,
+    pub(crate) edge_public_key: Option<String>,
+    pub(crate) previous_edge_public_key: Option<String>,
+    pub(crate) orchestrator_key_id: Option<String>,
+    pub(crate) orchestrator_public_key: Option<String>,
+    pub(crate) payload_json: Value,
+    pub(crate) created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct OrchestratorSignerStateRecord {
+    pub(crate) key_id: String,
+    pub(crate) public_key: String,
+    pub(crate) status: String,
+    pub(crate) active: bool,
+    pub(crate) actor_username: Option<String>,
+    pub(crate) actor_display_name: Option<String>,
+    pub(crate) actor_role: Option<String>,
+    pub(crate) reason: Option<String>,
+    pub(crate) staged_at: Option<DateTime<Utc>>,
+    pub(crate) activated_at: Option<DateTime<Utc>>,
+    pub(crate) retired_at: Option<DateTime<Utc>>,
+    pub(crate) updated_at: DateTime<Utc>,
+}
+
 impl DeviceTrustMetadata {
     pub(crate) fn normalized(
         mut self,
@@ -385,6 +420,11 @@ pub(crate) struct DeviceRecord {
 #[derive(Debug, Deserialize)]
 pub(crate) struct RevokeDeviceTrustRequest {
     pub(crate) edge_public_key: Option<String>,
+    pub(crate) reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct TrustLifecycleActionRequest {
     pub(crate) reason: Option<String>,
 }
 

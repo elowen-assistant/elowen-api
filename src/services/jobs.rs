@@ -299,6 +299,7 @@ pub(crate) async fn select_dispatch_device(
         requested_device_id.and_then(|value| sanitize_optional_string(Some(value.to_string())))
     {
         let device: crate::models::DeviceRecord = load_device_row(pool, &device_id).await?.into();
+        ensure_device_trusted_for_dispatch(&device)?;
         ensure_target_allowed(&device, target_kind, target_name)?;
         return Ok(device);
     }
@@ -306,6 +307,9 @@ pub(crate) async fn select_dispatch_device(
     let devices = list_devices(pool).await?;
 
     for record in devices {
+        if ensure_device_trusted_for_dispatch(&record).is_err() {
+            continue;
+        }
         if ensure_target_allowed(&record, target_kind, target_name).is_ok() {
             return Ok(record);
         }
@@ -318,6 +322,29 @@ pub(crate) async fn select_dispatch_device(
     Err(AppError::conflict(anyhow!(
         "no registered device is eligible for the requested {detail}"
     )))
+}
+
+pub(crate) fn ensure_device_trusted_for_dispatch(
+    device: &crate::models::DeviceRecord,
+) -> Result<(), AppError> {
+    let status = match device.trust.status {
+        crate::models::DeviceTrustStatus::Trusted => "trusted",
+        crate::models::DeviceTrustStatus::Rotated => "rotated",
+        crate::models::DeviceTrustStatus::Revoked => "revoked",
+        crate::models::DeviceTrustStatus::Untrusted => "untrusted",
+        crate::models::DeviceTrustStatus::AttentionRequired => "needs_attention",
+    };
+    if device.trust.can_dispatch == Some(false)
+        || device.trust.requires_attention
+        || status != "trusted"
+    {
+        return Err(AppError::conflict(anyhow!(
+            "device `{}` is not trusted for dispatch; trust status is {status}",
+            device.id
+        ))
+        .with_code("dispatch_device_not_trusted"));
+    }
+    Ok(())
 }
 
 fn ensure_target_allowed(
