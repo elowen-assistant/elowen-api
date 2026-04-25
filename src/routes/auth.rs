@@ -49,7 +49,7 @@ pub(crate) async fn registration_challenge(
     State(state): State<AppState>,
 ) -> Result<Json<RegistrationChallengeResponse>, AppError> {
     let (orchestrator_key_id, orchestrator_public_key, signing_key) =
-        load_active_orchestrator_signer(&state)?;
+        load_active_orchestrator_signer(&state).await?;
     let challenge_id = Ulid::new().to_string();
     let mut challenge_bytes = [0_u8; 32];
     rand::thread_rng().fill_bytes(&mut challenge_bytes);
@@ -64,7 +64,7 @@ pub(crate) async fn registration_challenge(
         issued_at,
         orchestrator_key_id: Some(orchestrator_key_id),
         orchestrator_public_key,
-        trusted_signers: exported_orchestrator_signers(&state)?,
+        trusted_signers: exported_orchestrator_signers(&state).await?,
         signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
     }))
 }

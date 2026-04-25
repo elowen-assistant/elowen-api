@@ -9,6 +9,7 @@ use serde_json::json;
 use crate::{
     db::{
         approvals::{load_approval_record, reset_approval_to_pending, resolve_approval_record},
+        devices::load_device_row,
         jobs::{
             insert_job_event, load_job_correlation_id, load_job_record, update_job_status_only,
         },
@@ -71,6 +72,13 @@ pub(crate) async fn resolve_approval(
             return Err(AppError::conflict(anyhow::anyhow!(
                 "approved push job is missing a branch name"
             )));
+        }
+        let device_id = approval_job.device_id.as_deref().unwrap();
+        let device: crate::models::DeviceRecord =
+            load_device_row(&state.pool, device_id).await?.into();
+        if let Err(error) = crate::services::jobs::ensure_device_trusted_for_dispatch(&device) {
+            reset_approval_to_pending(&state.pool, &approval.id).await?;
+            return Err(error);
         }
         if let Err(error) =
             publish_push_approval_command(&state.nats, &approval, &approval_job).await

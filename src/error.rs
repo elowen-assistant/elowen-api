@@ -11,6 +11,8 @@ use serde::Serialize;
 #[derive(Debug, Serialize)]
 pub(crate) struct ErrorResponse {
     pub(crate) error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) code: Option<String>,
 }
 
 /// Application error that carries an HTTP status code.
@@ -18,6 +20,7 @@ pub(crate) struct ErrorResponse {
 pub(crate) struct AppError {
     pub(crate) status: StatusCode,
     pub(crate) error: anyhow::Error,
+    pub(crate) code: Option<String>,
 }
 
 impl AppError {
@@ -25,6 +28,7 @@ impl AppError {
         Self {
             status: StatusCode::BAD_REQUEST,
             error: message.into(),
+            code: None,
         }
     }
 
@@ -32,6 +36,7 @@ impl AppError {
         Self {
             status: StatusCode::NOT_FOUND,
             error: message.into(),
+            code: None,
         }
     }
 
@@ -39,6 +44,7 @@ impl AppError {
         Self {
             status: StatusCode::CONFLICT,
             error: message.into(),
+            code: None,
         }
     }
 
@@ -46,6 +52,7 @@ impl AppError {
         Self {
             status: StatusCode::UNAUTHORIZED,
             error: message.into(),
+            code: None,
         }
     }
 
@@ -53,6 +60,7 @@ impl AppError {
         Self {
             status: StatusCode::FORBIDDEN,
             error: message.into(),
+            code: None,
         }
     }
 
@@ -60,7 +68,13 @@ impl AppError {
         Self {
             status: StatusCode::GATEWAY_TIMEOUT,
             error: message.into(),
+            code: None,
         }
+    }
+
+    pub(crate) fn with_code(mut self, code: impl Into<String>) -> Self {
+        self.code = Some(code.into());
+        self
     }
 }
 
@@ -72,6 +86,7 @@ where
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             error: error.into(),
+            code: None,
         }
     }
 }
@@ -82,6 +97,7 @@ impl IntoResponse for AppError {
             self.status,
             Json(ErrorResponse {
                 error: self.error.to_string(),
+                code: self.code,
             }),
         )
             .into_response()

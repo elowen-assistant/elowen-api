@@ -2,26 +2,34 @@
 
 use anyhow::Context;
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, State},
     http::StatusCode,
 };
 use chrono::Utc;
+use serde_json::json;
 use std::collections::BTreeMap;
 use tokio::time::timeout;
 use ulid::Ulid;
 
 use crate::{
-    db::devices::{
-        list_devices as load_devices, load_device_row, load_device_row_optional, upsert_device_row,
+    auth::SessionActor,
+    db::{
+        devices::{
+            list_devices as load_devices, load_device_row, load_device_row_optional,
+            upsert_device_row,
+        },
+        trust::{NewDeviceTrustEvent, insert_device_trust_event, list_device_trust_events},
     },
     error::AppError,
     formatting::{sanitize_optional_string, sanitize_string_list},
     models::{
         AvailabilityProbeMessage, AvailabilitySnapshot, DeviceMetadata, DeviceRecord,
-        DeviceRepository, DeviceTrustMetadata, DeviceTrustStatus, ProbeDeviceRequest,
-        RegisterDeviceRequest, RegistrationTrustIntent, RepositoryOption, RevokeDeviceTrustRequest,
+        DeviceRepository, DeviceTrustEventRecord, DeviceTrustMetadata, DeviceTrustStatus,
+        ProbeDeviceRequest, RegisterDeviceRequest, RegistrationTrustIntent, RepositoryOption,
+        RevokeDeviceTrustRequest, TrustLifecycleActionRequest,
     },
+    routes::require_session_actor,
     services::jobs::selectable_repositories,
     services::ui_events::{device_ui_event, publish_ui_event},
     state::AppState,
@@ -90,7 +98,8 @@ pub(crate) async fn register_device(
         request.primary_flag,
         now,
         request.trust.as_ref(),
-    )?;
+    )
+    .await?;
     let existing_metadata = existing.as_ref().map(|row| row.metadata.0.clone());
     let existing_trust = existing_metadata
         .as_ref()
@@ -102,6 +111,7 @@ pub(crate) async fn register_device(
         })
         .unwrap_or_default();
 
+    let previous_status = trust_status_value(&existing_trust).to_string();
     let mut trust = next_device_trust_state(existing_trust, trusted_registration.as_ref())?;
     trust.enrollment_kind = Some(enrollment_kind(
         request.primary_flag,
@@ -149,6 +159,37 @@ pub(crate) async fn register_device(
     };
 
     let device: DeviceRecord = device.into();
+    if previous_status != trust_status_value(&device.trust)
+        || trusted_registration
+            .as_ref()
+            .is_some_and(|registration| registration.previous_edge_public_key.is_some())
+    {
+        let _ = insert_device_trust_event(
+            &state.pool,
+            NewDeviceTrustEvent {
+                device_id: &device.id,
+                event_type: "registration.trust_state_changed",
+                actor: None,
+                reason: device.trust.reason.as_deref(),
+                previous_status: Some(&previous_status),
+                next_status: Some(trust_status_value(&device.trust)),
+                edge_public_key: device.trust.current_edge_public_key.as_deref(),
+                previous_edge_public_key: trusted_registration
+                    .as_ref()
+                    .and_then(|registration| registration.previous_edge_public_key.as_deref()),
+                orchestrator_key_id: trusted_registration
+                    .as_ref()
+                    .map(|registration| registration.orchestrator_key_id.as_str()),
+                orchestrator_public_key: trusted_registration
+                    .as_ref()
+                    .map(|registration| registration.orchestrator_public_key.as_str()),
+                payload_json: json!({
+                    "registration_intent": trusted_registration.as_ref().map(|registration| &registration.registration_intent),
+                }),
+            },
+        )
+        .await;
+    }
     publish_ui_event(&state, device_ui_event(&device.id));
 
     Ok((status, Json(device)))
@@ -156,9 +197,11 @@ pub(crate) async fn register_device(
 
 pub(crate) async fn revoke_device_trust(
     State(state): State<AppState>,
+    actor: Option<Extension<SessionActor>>,
     Path(device_id): Path<String>,
     Json(request): Json<RevokeDeviceTrustRequest>,
 ) -> Result<Json<DeviceRecord>, AppError> {
+    let actor = require_session_actor(actor);
     let device = load_device_row(&state.pool, &device_id).await?;
     let mut metadata = device.metadata.0.clone();
     let mut trust = metadata.trust.clone().normalized(
@@ -187,6 +230,7 @@ pub(crate) async fn revoke_device_trust(
         trust.revoked_edge_public_keys.sort();
         trust.revoked_edge_public_keys.dedup();
     }
+    let previous_status = trust_status_value(&trust).to_string();
     trust.status = DeviceTrustStatus::Revoked;
     trust.revoked_at = Some(Utc::now());
     trust.reason = request
@@ -217,9 +261,161 @@ pub(crate) async fn revoke_device_trust(
     )
     .await?
     .into();
+    insert_device_trust_event(
+        &state.pool,
+        NewDeviceTrustEvent {
+            device_id: &device.id,
+            event_type: "trust.revoked",
+            actor: Some(&actor),
+            reason: device.trust.reason.as_deref(),
+            previous_status: Some(&previous_status),
+            next_status: Some(trust_status_value(&device.trust)),
+            edge_public_key: Some(&target_key),
+            previous_edge_public_key: None,
+            orchestrator_key_id: None,
+            orchestrator_public_key: None,
+            payload_json: json!({}),
+        },
+    )
+    .await?;
     publish_ui_event(&state, device_ui_event(&device.id));
 
     Ok(Json(device))
+}
+
+pub(crate) async fn list_device_trust_history(
+    State(state): State<AppState>,
+    Path(device_id): Path<String>,
+) -> Result<Json<Vec<DeviceTrustEventRecord>>, AppError> {
+    let _ = load_device_row(&state.pool, &device_id).await?;
+    Ok(Json(
+        list_device_trust_events(&state.pool, &device_id).await?,
+    ))
+}
+
+pub(crate) async fn confirm_device_trust_rotation(
+    State(state): State<AppState>,
+    actor: Option<Extension<SessionActor>>,
+    Path(device_id): Path<String>,
+    Json(request): Json<TrustLifecycleActionRequest>,
+) -> Result<Json<DeviceRecord>, AppError> {
+    update_device_trust_admin_state(
+        state,
+        require_session_actor(actor),
+        &device_id,
+        "trust.rotation_confirmed",
+        DeviceTrustStatus::Trusted,
+        Some(DeviceTrustStatus::Rotated),
+        request.reason,
+    )
+    .await
+}
+
+pub(crate) async fn resolve_device_trust_attention(
+    State(state): State<AppState>,
+    actor: Option<Extension<SessionActor>>,
+    Path(device_id): Path<String>,
+    Json(request): Json<TrustLifecycleActionRequest>,
+) -> Result<Json<DeviceRecord>, AppError> {
+    update_device_trust_admin_state(
+        state,
+        require_session_actor(actor),
+        &device_id,
+        "trust.attention_resolved",
+        DeviceTrustStatus::Trusted,
+        Some(DeviceTrustStatus::AttentionRequired),
+        request.reason,
+    )
+    .await
+}
+
+pub(crate) async fn clear_device_trust_revocation(
+    State(state): State<AppState>,
+    actor: Option<Extension<SessionActor>>,
+    Path(device_id): Path<String>,
+    Json(request): Json<TrustLifecycleActionRequest>,
+) -> Result<Json<DeviceRecord>, AppError> {
+    update_device_trust_admin_state(
+        state,
+        require_session_actor(actor),
+        &device_id,
+        "trust.revocation_cleared",
+        DeviceTrustStatus::Untrusted,
+        Some(DeviceTrustStatus::Revoked),
+        request.reason,
+    )
+    .await
+}
+
+async fn update_device_trust_admin_state(
+    state: AppState,
+    actor: SessionActor,
+    device_id: &str,
+    event_type: &str,
+    next_status: DeviceTrustStatus,
+    expected_status: Option<DeviceTrustStatus>,
+    reason: Option<String>,
+) -> Result<Json<DeviceRecord>, AppError> {
+    let device = load_device_row(&state.pool, device_id).await?;
+    let mut metadata = device.metadata.0.clone();
+    let mut trust = metadata.trust.clone().normalized(
+        metadata.edge_public_key.clone(),
+        metadata.last_trusted_registration_at,
+    );
+    let previous_status = trust_status_value(&trust).to_string();
+    if let Some(expected_status) = expected_status
+        && trust.status != expected_status
+    {
+        return Err(AppError::conflict(anyhow::anyhow!(
+            "trust action cannot be applied while device is in {previous_status} state"
+        ))
+        .with_code("trust_action_state_mismatch"));
+    }
+    trust.status = next_status;
+    trust.status_reason = None;
+    trust.reason = reason
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if matches!(trust.status, DeviceTrustStatus::Untrusted) {
+        trust.current_edge_public_key = None;
+        trust.revoked_at = None;
+    }
+    if matches!(trust.status, DeviceTrustStatus::Trusted) {
+        trust.revoked_at = None;
+    }
+    trust = finalize_trust_metadata(trust);
+    metadata.trust = trust;
+    metadata.edge_public_key = None;
+    metadata.last_trusted_registration_at = None;
+    let updated: DeviceRecord = upsert_device_row(
+        &state.pool,
+        &device.id,
+        &device.name,
+        device.primary_flag,
+        metadata,
+    )
+    .await?
+    .into();
+    insert_device_trust_event(
+        &state.pool,
+        NewDeviceTrustEvent {
+            device_id: &updated.id,
+            event_type,
+            actor: Some(&actor),
+            reason: updated.trust.reason.as_deref(),
+            previous_status: Some(&previous_status),
+            next_status: Some(trust_status_value(&updated.trust)),
+            edge_public_key: updated.trust.current_edge_public_key.as_deref(),
+            previous_edge_public_key: None,
+            orchestrator_key_id: None,
+            orchestrator_public_key: None,
+            payload_json: json!({}),
+        },
+    )
+    .await?;
+    publish_ui_event(&state, device_ui_event(&updated.id));
+    Ok(Json(updated))
 }
 
 fn sanitize_device_repositories(repositories: Vec<DeviceRepository>) -> Vec<DeviceRepository> {
@@ -259,7 +455,8 @@ fn next_device_trust_state(
         if existing.revoked_at.is_some() {
             return Err(AppError::unauthorized(anyhow::anyhow!(
                 "device trust has been revoked and cannot be re-enrolled without clearing revocation"
-            )));
+            ))
+            .with_code("device_trust_revoked"));
         }
 
         if existing
@@ -269,12 +466,15 @@ fn next_device_trust_state(
         {
             return Err(AppError::unauthorized(anyhow::anyhow!(
                 "edge public key has been revoked for this device"
-            )));
+            ))
+            .with_code("edge_key_revoked"));
         }
 
         match existing.current_edge_public_key.clone() {
             Some(current_key) if current_key == registered.edge_public_key => {
-                existing.status = DeviceTrustStatus::Trusted;
+                if !matches!(existing.status, DeviceTrustStatus::Rotated) {
+                    existing.status = DeviceTrustStatus::Trusted;
+                }
             }
             Some(current_key) => {
                 if matches!(
@@ -283,7 +483,14 @@ fn next_device_trust_state(
                 ) {
                     return Err(AppError::conflict(anyhow::anyhow!(
                         "trusted device is already enrolled with a different key; use an explicit rotation or re-enrollment intent"
-                    )));
+                    ))
+                    .with_code("rotation_intent_required"));
+                }
+                if registered.previous_edge_public_key.as_deref() != Some(current_key.as_str()) {
+                    return Err(AppError::unauthorized(anyhow::anyhow!(
+                        "edge key rotation must be signed by the currently trusted edge key"
+                    ))
+                    .with_code("rotation_previous_key_mismatch"));
                 }
                 existing.previous_edge_public_keys.push(current_key);
                 existing.previous_edge_public_keys.sort();
@@ -291,6 +498,9 @@ fn next_device_trust_state(
                 existing.current_edge_public_key = Some(registered.edge_public_key.clone());
                 existing.rotated_at = Some(registered.registered_at);
                 existing.status = DeviceTrustStatus::Rotated;
+                existing.status_reason = Some(
+                    "Edge key rotated; admin confirmation is required before dispatch.".to_string(),
+                );
             }
             None => {
                 existing.current_edge_public_key = Some(registered.edge_public_key.clone());
@@ -342,7 +552,8 @@ fn finalize_trust_metadata(mut trust: DeviceTrustMetadata) -> DeviceTrustMetadat
 
     trust.requires_attention = matches!(
         trust.status,
-        DeviceTrustStatus::Revoked
+        DeviceTrustStatus::Rotated
+            | DeviceTrustStatus::Revoked
             | DeviceTrustStatus::Untrusted
             | DeviceTrustStatus::AttentionRequired
     );
@@ -352,7 +563,7 @@ fn finalize_trust_metadata(mut trust: DeviceTrustMetadata) -> DeviceTrustMetadat
         trust.summary = Some(match trust.status {
             DeviceTrustStatus::Trusted => "Trusted enrollment is active for this edge.".to_string(),
             DeviceTrustStatus::Rotated => {
-                "Trust material was rotated and should be verified before dispatch.".to_string()
+                "Trust material was rotated and must be confirmed before dispatch.".to_string()
             }
             DeviceTrustStatus::Revoked => "Trust for this edge has been revoked.".to_string(),
             DeviceTrustStatus::Untrusted => {
@@ -379,6 +590,16 @@ fn finalize_trust_metadata(mut trust: DeviceTrustMetadata) -> DeviceTrustMetadat
     trust
 }
 
+fn trust_status_value(trust: &DeviceTrustMetadata) -> &'static str {
+    match trust.status {
+        DeviceTrustStatus::Trusted => "trusted",
+        DeviceTrustStatus::Rotated => "rotated",
+        DeviceTrustStatus::Revoked => "revoked",
+        DeviceTrustStatus::Untrusted => "untrusted",
+        DeviceTrustStatus::AttentionRequired => "needs_attention",
+    }
+}
+
 fn enrollment_kind(
     primary_flag: bool,
     registration_intent: Option<&RegistrationTrustIntent>,
@@ -396,7 +617,7 @@ fn enrollment_kind(
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::next_device_trust_state;
+    use super::{finalize_trust_metadata, next_device_trust_state};
     use crate::{
         models::{DeviceTrustMetadata, DeviceTrustStatus, RegistrationTrustIntent},
         trust::TrustedRegistration,
@@ -414,6 +635,17 @@ mod tests {
             orchestrator_key_id: "orchestrator-1-testkey".to_string(),
             orchestrator_public_key: "test-public-key".to_string(),
             registration_intent,
+            previous_edge_public_key: None,
+        }
+    }
+
+    fn rotated_registration(
+        edge_public_key: &str,
+        previous_edge_public_key: &str,
+    ) -> TrustedRegistration {
+        TrustedRegistration {
+            previous_edge_public_key: Some(previous_edge_public_key.to_string()),
+            ..trusted_registration(edge_public_key, RegistrationTrustIntent::Rotate)
         }
     }
 
@@ -463,10 +695,7 @@ mod tests {
 
         let next = next_device_trust_state(
             existing,
-            Some(&trusted_registration(
-                "edge-key-b",
-                RegistrationTrustIntent::Rotate,
-            )),
+            Some(&rotated_registration("edge-key-b", "edge-key-a")),
         )
         .expect("explicit rotation should succeed");
 
@@ -477,6 +706,53 @@ mod tests {
             vec!["edge-key-a".to_string()]
         );
         assert!(next.rotated_at.is_some());
+        assert_eq!(next.can_dispatch, None);
+
+        let finalized = finalize_trust_metadata(next);
+        assert_eq!(finalized.can_dispatch, Some(false));
+        assert!(finalized.requires_attention);
+    }
+
+    #[test]
+    fn rotated_device_heartbeat_stays_rotated_until_admin_confirmation() {
+        let existing = DeviceTrustMetadata {
+            status: DeviceTrustStatus::Rotated,
+            current_edge_public_key: Some("edge-key-b".to_string()),
+            previous_edge_public_keys: vec!["edge-key-a".to_string()],
+            rotated_at: Some(Utc::now()),
+            ..Default::default()
+        };
+
+        let next = next_device_trust_state(
+            existing,
+            Some(&rotated_registration("edge-key-b", "edge-key-a")),
+        )
+        .expect("rotation heartbeat should be accepted");
+
+        assert_eq!(next.status, DeviceTrustStatus::Rotated);
+        let finalized = finalize_trust_metadata(next);
+        assert_eq!(finalized.can_dispatch, Some(false));
+        assert!(finalized.requires_attention);
+    }
+
+    #[test]
+    fn rotation_requires_previous_current_key_proof() {
+        let existing = DeviceTrustMetadata {
+            status: DeviceTrustStatus::Trusted,
+            current_edge_public_key: Some("edge-key-a".to_string()),
+            ..Default::default()
+        };
+
+        let error = next_device_trust_state(
+            existing,
+            Some(&trusted_registration(
+                "edge-key-b",
+                RegistrationTrustIntent::Rotate,
+            )),
+        )
+        .expect_err("rotation without previous proof should fail");
+
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
     }
 
     #[test]

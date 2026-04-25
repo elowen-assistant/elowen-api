@@ -16,12 +16,15 @@ use tracing::{info, warn};
 use crate::{
     auth::AuthProvider,
     routes::{
+        activate_orchestrator_signer, clear_device_trust_revocation, confirm_device_trust_rotation,
         create_chat_dispatch, create_job, create_message, create_thread, create_thread_chat,
         dispatch_thread_message, get_auth_session, get_device, get_job, get_job_notes, get_thread,
-        get_thread_notes, list_devices, list_jobs, list_repositories, list_thread_jobs,
-        list_threads, login, logout, probe_device, promote_job_note, register_device,
-        registration_challenge, require_admin_session, require_operator_session,
-        require_viewer_session, resolve_approval, revoke_device_trust, stream_ui_events,
+        get_thread_notes, list_device_trust_history, list_devices, list_jobs,
+        list_orchestrator_signers, list_repositories, list_thread_jobs, list_threads, login,
+        logout, probe_device, promote_job_note, register_device, registration_challenge,
+        require_admin_session, require_operator_session, require_viewer_session, resolve_approval,
+        resolve_device_trust_attention, retire_orchestrator_signer, revoke_device_trust,
+        stage_orchestrator_signer, stream_ui_events,
     },
     services::lifecycle::consume_job_lifecycle_events,
     state::{AppState, AssistantRuntime, AuthRuntime, TrustRuntime},
@@ -226,6 +229,35 @@ pub async fn run() -> anyhow::Result<()> {
         .route(
             "/devices/{device_id}/trust/revoke",
             post(revoke_device_trust),
+        )
+        .route(
+            "/devices/{device_id}/trust/events",
+            get(list_device_trust_history),
+        )
+        .route(
+            "/devices/{device_id}/trust/confirm-rotation",
+            post(confirm_device_trust_rotation),
+        )
+        .route(
+            "/devices/{device_id}/trust/resolve-attention",
+            post(resolve_device_trust_attention),
+        )
+        .route(
+            "/devices/{device_id}/trust/clear-revocation",
+            post(clear_device_trust_revocation),
+        )
+        .route("/trust/signers", get(list_orchestrator_signers))
+        .route(
+            "/trust/signers/{key_id}/stage",
+            post(stage_orchestrator_signer),
+        )
+        .route(
+            "/trust/signers/{key_id}/activate",
+            post(activate_orchestrator_signer),
+        )
+        .route(
+            "/trust/signers/{key_id}/retire",
+            post(retire_orchestrator_signer),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

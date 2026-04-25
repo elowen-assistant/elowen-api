@@ -4,3 +4,4 @@ pub(crate) mod approvals;
 pub(crate) mod devices;
 pub(crate) mod jobs;
 pub(crate) mod threads;
+pub(crate) mod trust;
