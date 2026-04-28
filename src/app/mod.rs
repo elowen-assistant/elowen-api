@@ -23,7 +23,7 @@ use crate::{
         list_orchestrator_signers, list_repositories, list_thread_jobs, list_threads, login,
         logout, probe_device, promote_job_note, register_device, registration_challenge,
         require_admin_session, require_operator_session, require_viewer_session, resolve_approval,
-        resolve_device_trust_attention, retire_orchestrator_signer, revoke_device_trust,
+        resolve_device_trust_attention, retire_orchestrator_signer, retry_job, revoke_device_trust,
         stage_orchestrator_signer, stream_ui_events,
     },
     services::lifecycle::consume_job_lifecycle_events,
@@ -214,6 +214,7 @@ pub async fn run() -> anyhow::Result<()> {
             post(create_chat_dispatch),
         )
         .route("/threads/{thread_id}/jobs", post(create_job))
+        .route("/jobs/{job_id}/retry", post(retry_job))
         .route("/jobs/{job_id}/notes/promote", post(promote_job_note))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

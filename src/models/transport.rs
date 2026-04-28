@@ -17,7 +17,11 @@ use super::persistence::{ApprovalRecord, JobRecord, MessageRecord, SummaryRecord
 /// Lightweight browser notification that tells the UI which REST resource changed.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct UiEvent {
+    pub(crate) event_id: String,
     pub(crate) event_type: String,
+    pub(crate) resource_kind: String,
+    pub(crate) resource_id: Option<String>,
+    pub(crate) action: String,
     pub(crate) thread_id: Option<String>,
     pub(crate) job_id: Option<String>,
     pub(crate) device_id: Option<String>,

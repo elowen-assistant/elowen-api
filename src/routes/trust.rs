@@ -10,6 +10,7 @@ use crate::{
     error::AppError,
     models::{OrchestratorSignerStateRecord, TrustLifecycleActionRequest},
     routes::require_session_actor,
+    services::ui_events::{publish_ui_event, signer_ui_event},
     state::AppState,
     trust::{list_orchestrator_signer_states, set_orchestrator_signer_status},
 };
@@ -27,16 +28,16 @@ pub(crate) async fn stage_orchestrator_signer(
     Json(request): Json<TrustLifecycleActionRequest>,
 ) -> Result<Json<OrchestratorSignerStateRecord>, AppError> {
     let actor = require_session_actor(actor);
-    Ok(Json(
-        set_orchestrator_signer_status(
-            &state,
-            &key_id,
-            "staged",
-            Some(&actor),
-            request.reason.as_deref(),
-        )
-        .await?,
-    ))
+    let signer = set_orchestrator_signer_status(
+        &state,
+        &key_id,
+        "staged",
+        Some(&actor),
+        request.reason.as_deref(),
+    )
+    .await?;
+    publish_ui_event(&state, signer_ui_event(&key_id));
+    Ok(Json(signer))
 }
 
 pub(crate) async fn activate_orchestrator_signer(
@@ -46,16 +47,16 @@ pub(crate) async fn activate_orchestrator_signer(
     Json(request): Json<TrustLifecycleActionRequest>,
 ) -> Result<Json<OrchestratorSignerStateRecord>, AppError> {
     let actor = require_session_actor(actor);
-    Ok(Json(
-        set_orchestrator_signer_status(
-            &state,
-            &key_id,
-            "active",
-            Some(&actor),
-            request.reason.as_deref(),
-        )
-        .await?,
-    ))
+    let signer = set_orchestrator_signer_status(
+        &state,
+        &key_id,
+        "active",
+        Some(&actor),
+        request.reason.as_deref(),
+    )
+    .await?;
+    publish_ui_event(&state, signer_ui_event(&key_id));
+    Ok(Json(signer))
 }
 
 pub(crate) async fn retire_orchestrator_signer(
@@ -65,14 +66,14 @@ pub(crate) async fn retire_orchestrator_signer(
     Json(request): Json<TrustLifecycleActionRequest>,
 ) -> Result<Json<OrchestratorSignerStateRecord>, AppError> {
     let actor = require_session_actor(actor);
-    Ok(Json(
-        set_orchestrator_signer_status(
-            &state,
-            &key_id,
-            "retired",
-            Some(&actor),
-            request.reason.as_deref(),
-        )
-        .await?,
-    ))
+    let signer = set_orchestrator_signer_status(
+        &state,
+        &key_id,
+        "retired",
+        Some(&actor),
+        request.reason.as_deref(),
+    )
+    .await?;
+    publish_ui_event(&state, signer_ui_event(&key_id));
+    Ok(Json(signer))
 }

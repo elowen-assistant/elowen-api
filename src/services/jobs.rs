@@ -10,13 +10,13 @@ use crate::{
     db::{
         approvals::load_job_approvals,
         devices::{list_devices, load_device_row},
-        jobs::{build_job_detail, insert_job_event, load_job_record},
+        jobs::{build_job_detail, insert_job_event, load_job_events, load_job_record},
     },
     error::AppError,
     formatting::{sanitize_optional_string, slugify},
     models::{
-        ApprovalRecord, CreateJobRequest, DeviceRepository, JobApprovalCommand, JobDetail,
-        JobDispatchMessage, JobRecord, JobTargetKind,
+        ApprovalRecord, CreateJobRequest, DeviceRepository, ExecutionIntent, JobApprovalCommand,
+        JobDetail, JobDispatchMessage, JobRecord, JobTargetKind,
     },
     services::notes::load_related_job_notes,
     state::AppState,
@@ -151,42 +151,112 @@ pub(crate) async fn create_job_record(
     )
     .await?;
 
+    let request = DispatchAttempt {
+        job_id: job_id.clone(),
+        short_id,
+        correlation_id: correlation_id.clone(),
+        thread_id: thread_id.to_string(),
+        title: title.to_string(),
+        target_kind,
+        target_name,
+        repo_name,
+        capability_name,
+        device_id: target_device.id,
+        base_branch,
+        branch_name,
+        prompt: prompt.to_string(),
+        execution_intent,
+    };
+
+    attempt_job_dispatch(state, request, false).await?;
+    load_job_record(&state.pool, &job_id).await
+}
+
+#[derive(Debug, Clone)]
+struct DispatchAttempt {
+    job_id: String,
+    short_id: String,
+    correlation_id: String,
+    thread_id: String,
+    title: String,
+    target_kind: JobTargetKind,
+    target_name: String,
+    repo_name: Option<String>,
+    capability_name: Option<String>,
+    device_id: String,
+    base_branch: Option<String>,
+    branch_name: Option<String>,
+    prompt: String,
+    execution_intent: ExecutionIntent,
+}
+
+async fn attempt_job_dispatch(
+    state: &AppState,
+    request: DispatchAttempt,
+    retry: bool,
+) -> Result<(), AppError> {
+    if retry {
+        insert_job_event(
+            &state.pool,
+            &request.job_id,
+            &request.correlation_id,
+            "job.retry_requested",
+            json!({
+                "correlation_id": request.correlation_id.clone(),
+                "device_id": request.device_id,
+            }),
+        )
+        .await?;
+    }
+
+    crate::db::jobs::update_job_state(&state.pool, &request.job_id, "probing", None, None, None)
+        .await?;
+
     let availability = match crate::services::jobs::routes_shim::probe_device_via_nats(
         &state.nats,
-        &target_device.id,
-        Some(job_id.clone()),
+        &request.device_id,
+        Some(request.job_id.clone()),
     )
     .await
     {
         Ok(availability) => availability,
         Err(error) => {
-            crate::db::jobs::update_job_state(&state.pool, &job_id, "pending", None, None, None)
-                .await?;
-            insert_job_event(
-                &state.pool,
-                &job_id,
-                &correlation_id,
-                "job.probe_result",
-                json!({
-                    "correlation_id": correlation_id.clone(),
-                    "available": false,
-                    "reason": error.error.to_string(),
-                    "probe_error": true,
-                }),
+            mark_job_unavailable(
+                state,
+                &request.job_id,
+                &request.correlation_id,
+                error.error.to_string(),
+                true,
             )
             .await?;
-            return load_job_record(&state.pool, &job_id).await;
+            return Ok(());
         }
     };
 
+    if !availability.available {
+        mark_job_unavailable(
+            state,
+            &request.job_id,
+            &request.correlation_id,
+            if availability.reason.trim().is_empty() {
+                "edge reported unavailable".to_string()
+            } else {
+                availability.reason
+            },
+            false,
+        )
+        .await?;
+        return Ok(());
+    }
+
     insert_job_event(
         &state.pool,
-        &job_id,
-        &correlation_id,
+        &request.job_id,
+        &request.correlation_id,
         "job.probe_result",
         json!({
-            "correlation_id": correlation_id.clone(),
-            "available": availability.available,
+            "correlation_id": request.correlation_id.clone(),
+            "available": true,
             "reason": availability.reason,
             "probe_id": availability.probe_id,
             "responded_at": availability.responded_at,
@@ -194,28 +264,22 @@ pub(crate) async fn create_job_record(
     )
     .await?;
 
-    if !availability.available {
-        crate::db::jobs::update_job_state(&state.pool, &job_id, "pending", None, None, None)
-            .await?;
-        return load_job_record(&state.pool, &job_id).await;
-    }
-
     let dispatch = JobDispatchMessage {
-        job_id: job_id.clone(),
-        short_id,
-        correlation_id: correlation_id.clone(),
-        thread_id: thread_id.to_string(),
-        title: title.to_string(),
-        device_id: target_device.id.clone(),
-        target_kind: target_kind.clone(),
-        target_name: target_name.clone(),
-        base_branch: base_branch.clone(),
-        branch_name: branch_name.clone(),
-        prompt: prompt.to_string(),
-        execution_intent: execution_intent.clone(),
+        job_id: request.job_id.clone(),
+        short_id: request.short_id.clone(),
+        correlation_id: request.correlation_id.clone(),
+        thread_id: request.thread_id.clone(),
+        title: request.title.clone(),
+        device_id: request.device_id.clone(),
+        target_kind: request.target_kind.clone(),
+        target_name: request.target_name.clone(),
+        base_branch: request.base_branch.clone(),
+        branch_name: request.branch_name.clone(),
+        prompt: request.prompt.clone(),
+        execution_intent: request.execution_intent.clone(),
         dispatched_at: Utc::now(),
     };
-    let dispatch_subject = format!("elowen.jobs.dispatch.{}", target_device.id);
+    let dispatch_subject = format!("elowen.jobs.dispatch.{}", request.device_id);
     let dispatch_payload =
         serde_json::to_vec(&dispatch).context("failed to serialize job dispatch")?;
 
@@ -226,7 +290,7 @@ pub(crate) async fn create_job_record(
     {
         crate::db::jobs::update_job_state(
             &state.pool,
-            &job_id,
+            &request.job_id,
             "failed",
             Some("failure".to_string()),
             Some("infrastructure".to_string()),
@@ -235,11 +299,11 @@ pub(crate) async fn create_job_record(
         .await?;
         insert_job_event(
             &state.pool,
-            &job_id,
-            &correlation_id,
+            &request.job_id,
+            &request.correlation_id,
             "job.dispatch_failed",
             json!({
-                "correlation_id": correlation_id.clone(),
+                "correlation_id": request.correlation_id.clone(),
                 "subject": dispatch_subject,
                 "error": error.to_string(),
             }),
@@ -248,27 +312,137 @@ pub(crate) async fn create_job_record(
         return Err(AppError::from(anyhow!("failed to publish job dispatch")));
     }
 
-    crate::db::jobs::update_job_state(&state.pool, &job_id, "dispatched", None, None, None).await?;
+    crate::db::jobs::update_job_state(&state.pool, &request.job_id, "dispatched", None, None, None)
+        .await?;
     insert_job_event(
         &state.pool,
-        &job_id,
-        &correlation_id,
+        &request.job_id,
+        &request.correlation_id,
         "job.dispatched",
         json!({
-            "correlation_id": correlation_id.clone(),
+            "correlation_id": request.correlation_id.clone(),
             "subject": dispatch_subject,
-            "device_id": target_device.id.clone(),
-            "target_kind": target_kind,
-            "target_name": target_name,
-            "repo_name": repo_name,
-            "capability_name": capability_name,
-            "base_branch": base_branch.clone(),
-            "branch_name": branch_name.clone(),
-            "execution_intent": execution_intent,
+            "device_id": request.device_id,
+            "target_kind": request.target_kind,
+            "target_name": request.target_name,
+            "repo_name": request.repo_name,
+            "capability_name": request.capability_name,
+            "base_branch": request.base_branch,
+            "branch_name": request.branch_name,
+            "execution_intent": request.execution_intent,
         }),
     )
     .await?;
-    load_job_record(&state.pool, &job_id).await
+    Ok(())
+}
+
+async fn mark_job_unavailable(
+    state: &AppState,
+    job_id: &str,
+    correlation_id: &str,
+    reason: String,
+    probe_error: bool,
+) -> Result<(), AppError> {
+    insert_job_event(
+        &state.pool,
+        job_id,
+        correlation_id,
+        "job.probe_result",
+        json!({
+            "correlation_id": correlation_id,
+            "available": false,
+            "reason": reason,
+            "probe_error": probe_error,
+        }),
+    )
+    .await?;
+    crate::db::jobs::update_job_state(
+        &state.pool,
+        job_id,
+        "failed",
+        Some("failure".to_string()),
+        Some("edge_unavailable".to_string()),
+        Some(Utc::now()),
+    )
+    .await?;
+    insert_job_event(
+        &state.pool,
+        job_id,
+        correlation_id,
+        "job.failed",
+        json!({
+            "correlation_id": correlation_id,
+            "failure_class": "edge_unavailable",
+            "reason": "No edge client was available to accept the job. Use Retry when an edge is online.",
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn retry_job_dispatch(
+    state: &AppState,
+    job_id: &str,
+) -> Result<JobRecord, AppError> {
+    let job = load_job_record(&state.pool, job_id).await?;
+    if !matches!(job.status.as_str(), "failed" | "pending") {
+        return Err(AppError::conflict(anyhow!(
+            "only failed or legacy pending jobs can be retried"
+        ))
+        .with_code("job_retry_not_allowed"));
+    }
+
+    let target_kind = job.target_kind_enum();
+    let target_name = job.target_name().to_string();
+    let target_device = select_dispatch_device(
+        &state.pool,
+        job.device_id.as_deref(),
+        &target_kind,
+        &target_name,
+    )
+    .await?;
+    let events = load_job_events(&state.pool, &job.id).await?;
+    let created_payload = events
+        .iter()
+        .find(|event| event.event_type == "job.created")
+        .map(|event| event.payload_json.clone())
+        .ok_or_else(|| {
+            AppError::conflict(anyhow!("job cannot be retried without creation metadata"))
+        })?;
+    let prompt = created_payload
+        .get("prompt")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            AppError::conflict(anyhow!("job cannot be retried without original prompt"))
+        })?;
+    let execution_intent = serde_json::from_value::<ExecutionIntent>(
+        created_payload
+            .get("execution_intent")
+            .cloned()
+            .unwrap_or_else(|| json!("workspace_change")),
+    )
+    .unwrap_or(ExecutionIntent::WorkspaceChange);
+
+    let request = DispatchAttempt {
+        job_id: job.id.clone(),
+        short_id: job.short_id.clone(),
+        correlation_id: job.correlation_id.clone(),
+        thread_id: job.thread_id.clone(),
+        title: job.title.clone(),
+        target_kind,
+        target_name,
+        repo_name: job.repo_name.clone(),
+        capability_name: job.capability_name.clone(),
+        device_id: target_device.id,
+        base_branch: job.base_branch.clone(),
+        branch_name: job.branch_name.clone(),
+        prompt,
+        execution_intent,
+    };
+
+    attempt_job_dispatch(state, request, true).await?;
+    load_job_record(&state.pool, &job.id).await
 }
 
 pub(crate) async fn load_job_detail(state: &AppState, job_id: &str) -> Result<JobDetail, AppError> {

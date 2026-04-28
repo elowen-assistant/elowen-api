@@ -18,7 +18,7 @@ pub(crate) use devices::{
     list_device_trust_history, list_devices, list_repositories, probe_device, register_device,
     resolve_device_trust_attention, revoke_device_trust,
 };
-pub(crate) use jobs::{get_job, list_jobs};
+pub(crate) use jobs::{get_job, list_jobs, retry_job};
 pub(crate) use notes::{get_job_notes, get_thread_notes, promote_job_note};
 pub(crate) use threads::{
     create_chat_dispatch, create_job, create_message, create_thread, create_thread_chat,
