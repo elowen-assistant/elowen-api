@@ -8,7 +8,7 @@ use axum::{
 };
 use reqwest::Client as HttpClient;
 use sqlx::postgres::PgPoolOptions;
-use std::{env, net::SocketAddr, time::Duration};
+use std::{env, fs, net::SocketAddr, path::PathBuf, time::Duration};
 use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
@@ -100,17 +100,8 @@ pub async fn run() -> anyhow::Result<()> {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(14);
-    let orchestrator_signing_keys = parse_string_list_env("ELOWEN_ORCHESTRATOR_SIGNING_KEYS");
-    let orchestrator_signing_keys = if orchestrator_signing_keys.is_empty() {
-        env::var("ELOWEN_ORCHESTRATOR_SIGNING_KEY")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .into_iter()
-            .collect()
-    } else {
-        orchestrator_signing_keys
-    };
+    let orchestrator_signing_keys =
+        load_orchestrator_signing_keys().context("failed to load orchestrator signing keys")?;
     let require_trusted_edge_registration = env::var("ELOWEN_REQUIRE_TRUSTED_EDGE_REGISTRATION")
         .ok()
         .map(|value| parse_bool(&value))
@@ -318,4 +309,77 @@ fn parse_string_list_env(key: &str) -> Vec<String> {
         .map(|item| item.trim().to_string())
         .filter(|item| !item.is_empty())
         .collect()
+}
+
+fn load_orchestrator_signing_keys() -> anyhow::Result<Vec<String>> {
+    let mut keys = parse_string_list_env("ELOWEN_ORCHESTRATOR_SIGNING_KEYS");
+    if keys.is_empty() {
+        keys.extend(
+            env::var("ELOWEN_ORCHESTRATOR_SIGNING_KEY")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+        );
+    }
+
+    let mut paths = parse_string_list_env("ELOWEN_ORCHESTRATOR_SIGNING_KEY_FILES")
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        paths.extend(
+            env::var("ELOWEN_ORCHESTRATOR_SIGNING_KEY_FILE")
+                .ok()
+                .map(|value| PathBuf::from(value.trim()))
+                .filter(|value| !value.as_os_str().is_empty()),
+        );
+    }
+    keys.extend(read_signing_key_files(&paths)?);
+    Ok(keys)
+}
+
+fn read_signing_key_files(paths: &[PathBuf]) -> anyhow::Result<Vec<String>> {
+    paths
+        .iter()
+        .map(|path| {
+            let value = fs::read_to_string(path)
+                .with_context(|| format!("failed to read signer key file {}", path.display()))?
+                .trim()
+                .to_string();
+            if value.is_empty() {
+                anyhow::bail!("signer key file {} is empty", path.display());
+            }
+            Ok(value)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_signing_key_files;
+    use std::{fs, path::PathBuf};
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("elowen-api-app-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn signer_key_files_trim_and_reject_empty_values() {
+        let root = unique_temp_dir("signer-files");
+        let key_file = root.join("orchestrator.key");
+        let empty_file = root.join("empty.key");
+        fs::write(&key_file, " signer-key \n").unwrap();
+        fs::write(&empty_file, "\n").unwrap();
+
+        let keys = read_signing_key_files(std::slice::from_ref(&key_file)).unwrap();
+        assert_eq!(keys, vec!["signer-key"]);
+
+        let error = read_signing_key_files(&[empty_file]).unwrap_err();
+        assert!(error.to_string().contains("is empty"));
+        let _ = fs::remove_dir_all(root);
+    }
 }

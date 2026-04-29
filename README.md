@@ -41,7 +41,11 @@ Important environment variables:
 - `OPENAI_API_KEY`
 - `ELOWEN_UI_PASSWORD`
 - `ELOWEN_ORCHESTRATOR_SIGNING_KEY`
+- `ELOWEN_ORCHESTRATOR_SIGNING_KEY_FILE`
+- `ELOWEN_ORCHESTRATOR_SIGNING_KEY_FILES`
 - `ELOWEN_REQUIRE_TRUSTED_EDGE_REGISTRATION`
+
+`ELOWEN_ORCHESTRATOR_SIGNING_KEY` and `ELOWEN_ORCHESTRATOR_SIGNING_KEYS` remain supported for compatibility. For hardened deployments, mount signer private keys as files and set `ELOWEN_ORCHESTRATOR_SIGNING_KEY_FILE` for one key or `ELOWEN_ORCHESTRATOR_SIGNING_KEY_FILES` for a comma-separated or JSON array list. The API derives public signer metadata from those private keys and persists only public key ids, public keys, status, and lifecycle timestamps.
 
 ## Local Verification
 

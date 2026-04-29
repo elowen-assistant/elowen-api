@@ -195,28 +195,7 @@ pub(crate) async fn load_active_orchestrator_signer(
 async fn load_orchestrator_signers(
     state: &AppState,
 ) -> Result<Vec<ConfiguredOrchestratorSigner>, AppError> {
-    if state.trust.orchestrator_signing_keys.is_empty() {
-        return Err(AppError::conflict(anyhow!(
-            "orchestrator signing key is not configured"
-        )));
-    }
-
-    let mut configured = state
-        .trust
-        .orchestrator_signing_keys
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            let signing_key = decode_signing_key(value, "orchestrator signing key")?;
-            let public_key = URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes());
-            Ok(ConfiguredOrchestratorSigner {
-                key_id: orchestrator_key_id(&public_key, index),
-                public_key,
-                signing_key,
-                status: String::new(),
-            })
-        })
-        .collect::<Result<Vec<_>, AppError>>()?;
+    let mut configured = configured_orchestrator_signers(state)?;
 
     sync_configured_signers(state, &configured).await?;
     let states = list_signer_states(&state.pool).await?;
@@ -308,6 +287,12 @@ pub(crate) async fn set_orchestrator_signer_status(
 fn configured_orchestrator_signers(
     state: &AppState,
 ) -> Result<Vec<ConfiguredOrchestratorSigner>, AppError> {
+    if state.trust.orchestrator_signing_keys.is_empty() {
+        return Err(AppError::conflict(anyhow!(
+            "orchestrator signing key is not configured"
+        )));
+    }
+
     state
         .trust
         .orchestrator_signing_keys
